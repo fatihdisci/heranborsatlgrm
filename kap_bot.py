@@ -59,6 +59,7 @@ class PublicKapClient:
         detail = {
             "subject": {"tr": "Pay Bazında Devre Kesici Bildirimi" if is_circuit else summary_text},
             "summary": {"tr": summary_text},
+            "content": {"tr": clean(explanation.group(1)) if explanation else ""},
             "relatedStocks": [{"code": company.group(1)}] if company else [],
             "time": sent_at.group(1) if sent_at else "",
             "link": self.base + str(index),
@@ -89,19 +90,32 @@ def stocks(detail):
     return [x.get("code") for x in detail.get("relatedStocks", []) if x.get("code")]
 def tweet_only(text):
     """Keep the Telegram payload ready to paste into X, with no meta labels."""
+    text = re.sub(r"https?://\S+", "", text, flags=re.I)
     text = clean(text).strip().strip('"“”')
     text = re.sub(r"^(tweet|tweet metni|taslak|x paylaşımı)\s*[:\-–]\s*", "", text, flags=re.I)
     return text.strip().strip('"“”')[:280].strip()
+def required_tags(text, codes):
+    """Guarantee stock codes and market tags while staying within X's limit."""
+    tags = [f"#{code}" for code in codes] + ["#borsa", "#bist"]
+    missing = [tag for tag in tags if tag.lower() not in text.lower()]
+    if not missing: return text[:280]
+    suffix = " " + " ".join(missing)
+    room = 280 - len(suffix)
+    base = text[:room].rstrip()
+    if len(text) > room and " " in base: base = base.rsplit(" ", 1)[0]
+    return (base + suffix).strip()
 def is_important(item, detail):
     joined = " ".join([item.get("disclosureType", ""), text_of(detail.get("subject")), text_of(detail.get("summary")), detail.get("senderTitle", "")])
     return item.get("disclosureType") in {"ODA", "CA", "OD", "FR", "DGK", "DKB"} or bool(KEYWORDS.search(joined)) or bool(stocks(detail))
 
 def draft(detail):
     subject, summary = clean(text_of(detail.get("subject"))), clean(text_of(detail.get("summary")))
-    codes = " ".join(f"#{x}" for x in stocks(detail))
+    content = clean(text_of(detail.get("content")))
+    stock_codes = stocks(detail)
+    codes = " ".join(f"#{x}" for x in stock_codes)
     api_key = cfg("AI_API_KEY")
     if api_key:
-        prompt = "Türkçe borsa gündemini doğal ve akıcı anlatan deneyimli bir editörsün. Verilen KAP bildiriminden en fazla 280 karakterlik, kopyalayıp doğrudan X'te paylaşılabilecek tek bir tweet yaz. Resmî bülten ya da yapay zekâ gibi konuşma; kısa, sade ve doğal piyasa dili kullan. Haberle uyumlu tek bir emoji kullan (örneğin devre kesicide ⚠️); emoji yağmuru yapma. Yatırım tavsiyesi, tahmin, abartı veya uydurma bilgi ekleme. Varsa hisse kodunu # etiketiyle kullan ve KAP bağlantısını metne ekle. Kesinlikle başlık, 'Tweet:', 'Taslak:', açıklama, tırnak işareti veya alternatif sürüm yazma; yalnızca paylaşılacak metni döndür.\n\n" + json.dumps({"subject": subject, "summary": summary, "stocks": stocks(detail), "link": detail.get("link")}, ensure_ascii=False)
+        prompt = "Türkçe borsa gündemini doğal ve akıcı anlatan deneyimli bir editörsün. Verilen KAP bildiriminden 220-280 karakter aralığında, kopyalayıp doğrudan X'te paylaşılabilecek tek bir tweet yaz. Bildirimin açıklama detayındaki somut bilgileri kullan; resmî bülten ya da yapay zekâ gibi konuşma. Haberle uyumlu tek emoji kullan; emoji yağmuru yapma. Yatırım tavsiyesi, tahmin, abartı veya uydurma bilgi ekleme. İlgili her hisse kodunu # etiketiyle, ayrıca #borsa ve #bist etiketlerini kesinlikle yaz. KAP bağlantısı veya başka URL yazma. Kesinlikle başlık, 'Tweet:', 'Taslak:', açıklama, tırnak işareti veya alternatif sürüm yazma; yalnızca paylaşılacak metni döndür.\n\n" + json.dumps({"subject": subject, "summary": summary, "detail": content, "stocks": stock_codes}, ensure_ascii=False)
         # GPT-5.6 family uses the current Responses API. Its compact output is
         # extracted below without relying on a particular SDK.
         body = json.dumps({"model": cfg("AI_MODEL", "gpt-5.6-luna"), "input":prompt, "max_output_tokens":180, "store":False}).encode()
@@ -112,12 +126,13 @@ def draft(detail):
             output = result.get("output_text")
             if not output:
                 output = "".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
-            if output: return tweet_only(output)
+            if output: return required_tags(tweet_only(output), stock_codes)
             raise ValueError("AI yanıtında metin yok")
         except Exception as error: logging.warning("AI taslağı üretilemedi (%s); yerel taslağa geçiliyor", error)
     emoji = "⚠️ " if re.search(r"devre kesici|sürekli işleme ara", f"{subject} {summary}", re.I) else "📌 "
     body = f"{emoji}{codes + ' ' if codes else ''}{subject or summary}"
-    return tweet_only(body + (f" — {summary}" if summary and summary.lower() != subject.lower() else "") + f"\n{detail.get('link','')}")
+    extra = content or summary
+    return required_tags(tweet_only(body + (f" — {extra}" if extra and extra.lower() != subject.lower() else "")), stock_codes)
 
 def telegram_send(text):
     token, chat = cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")
