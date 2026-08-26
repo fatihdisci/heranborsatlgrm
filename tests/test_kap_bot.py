@@ -21,9 +21,10 @@ class KapBotTests(unittest.TestCase):
         detail = {"subject": {"tr": "Pay Bazında Devre Kesici Bildirimi"}, "summary": {"tr": "Devre kesici uygulaması"}, "relatedStocks": [{"code": "AVGY0"}]}
         self.assertTrue(kap_bot.is_important(item, detail))
 
-    def test_circuit_breaker_message_is_complete_and_deterministic(self):
+    def test_notification_is_compact_and_contains_only_requested_fields(self):
         detail = {"subject": {"tr": "Pay Bazında Devre Kesici Bildirimi"}, "summary": {"tr": "Devre kesici uygulaması"}, "content": {"tr": "Sürekli işleme ara verilmiş, tek fiyat emir toplama başlamıştır. İşlemlere 15:21:21 itibarıyla devam edilecektir."}, "relatedStocks": [{"code": "IHAAS"}]}
-        self.assertEqual(kap_bot.draft(detail), "⚠️ IHAAS'ta devre kesici devrede. Sürekli işleme ara verildi, tek fiyat emir toplama başladı. İşlemler 15:21:21'de yeniden başlayacak. #IHAAS #borsa #bist")
+        detail["link"] = "https://www.kap.org.tr/tr/Bildirim/1655131"
+        self.assertEqual(kap_bot.draft(detail), "#IHAAS\nPay Bazında Devre Kesici Bildirimi\nhttps://www.kap.org.tr/tr/Bildirim/1655131")
 
     def test_required_tags_removes_urls_and_keeps_ticker(self):
         text = kap_bot.required_tags(kap_bot.tweet_only("Kısa açıklama https://example.com"), ["AVGY0"])
