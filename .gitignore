@@ -3,3 +3,4 @@ data/*.sqlite3
 logs/
 __pycache__/
 *.pyc
+.DS_Store
