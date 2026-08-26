@@ -49,7 +49,9 @@ class PublicKapClient:
         # KAP's Next.js page embeds the disclosure in escaped HTML/JSON.
         source = html.unescape(source.replace("\\u003c", "<").replace("\\u003e", ">").replace("\\\"", '"').replace("\\n", " "))
         summary = re.search(r'class="disclosureSummary[^>]*>(.*?)</div>', source, re.S)
-        company = re.search(r'Related Companies.*?\[([A-Z0-9.]+)\]', source, re.S)
+        # Keep the match inside the related-company cell.  A broad match can
+        # accidentally pick a later numeric field (for example, "18").
+        company = re.search(r'Related Companies.*?<div class="gwt-Label">\[([A-Z]{2,6}(?:\s*,\s*[A-Z]{2,6})*)\]</div>', source, re.S)
         explanation = re.search(r'text-block-value[^>]*>.*?<p[^>]*>(.*?)</p>', source, re.S)
         sent_at = re.search(r'(\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2})', source)
         if not summary and not explanation: return None
@@ -60,7 +62,7 @@ class PublicKapClient:
             "subject": {"tr": "Pay Bazında Devre Kesici Bildirimi" if is_circuit else summary_text},
             "summary": {"tr": summary_text},
             "content": {"tr": clean(explanation.group(1)) if explanation else ""},
-            "relatedStocks": [{"code": company.group(1)}] if company else [],
+            "relatedStocks": [{"code": code.strip()} for code in company.group(1).split(",")] if company else [],
             "time": sent_at.group(1) if sent_at else "",
             "link": self.base + str(index),
         }
@@ -87,7 +89,7 @@ def clean(value):
 def text_of(obj, lang="tr"):
     return obj.get(lang) if isinstance(obj, dict) else (obj or "")
 def stocks(detail):
-    return [x.get("code") for x in detail.get("relatedStocks", []) if x.get("code")]
+    return [x.get("code") for x in detail.get("relatedStocks", []) if re.fullmatch(r"[A-Z]{2,6}", x.get("code", ""))]
 def tweet_only(text):
     """Keep the Telegram payload ready to paste into X, with no meta labels."""
     text = re.sub(r"https?://\S+", "", text, flags=re.I)
@@ -106,6 +108,9 @@ def required_tags(text, codes):
     return (base + suffix).strip()
 def is_important(item, detail):
     joined = " ".join([item.get("disclosureType", ""), text_of(detail.get("subject")), text_of(detail.get("summary")), detail.get("senderTitle", "")])
+    # These notices are not useful as ticker alerts when KAP provides no
+    # related listed company; never invent a numeric or unrelated hashtag.
+    if re.search(r"pay alım satım bildirimi", joined, re.I) and not stocks(detail): return False
     return item.get("disclosureType") in {"ODA", "CA", "OD", "FR", "DGK", "DKB"} or bool(KEYWORDS.search(joined)) or bool(stocks(detail))
 
 def draft(detail):
