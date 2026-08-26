@@ -127,11 +127,23 @@ def is_important(item, detail):
     if not stocks(detail) or NOISE.search(joined): return False
     return item.get("disclosureType") == "DKB" or bool(KEYWORDS.search(joined))
 
+def circuit_tweet(detail):
+    """Circuit-breaker notices are time-sensitive; do not risk an AI fragment."""
+    codes = stocks(detail)
+    code = codes[0]
+    content = clean(text_of(detail.get("content")) or text_of(detail.get("summary")))
+    resume = re.search(r"(?:işlemlere|işlemler)\s+(\d{1,2}:\d{2}:\d{2}).{0,30}?devam", content, re.I)
+    text = f"⚠️ {code}'ta devre kesici devrede. Sürekli işleme ara verildi, tek fiyat emir toplama başladı."
+    if resume: text += f" İşlemler {resume.group(1)}'de yeniden başlayacak."
+    return required_tags(text, codes)
+
 def draft(detail):
     subject, summary = clean(text_of(detail.get("subject"))), clean(text_of(detail.get("summary")))
     content = clean(text_of(detail.get("content")))
     stock_codes = stocks(detail)
     codes = " ".join(f"#{x}" for x in stock_codes)
+    if re.search(r"devre kesici|sürekli işleme ara", f"{subject} {summary} {content}", re.I):
+        return circuit_tweet(detail)
     api_key = cfg("AI_API_KEY")
     if api_key:
         prompt = "Türkçe borsa gündemini takip eden gerçek bir yatırımcı gibi yaz. Verilen KAP bildiriminden 110-220 karakterlik, tek parça ve doğrudan X'te paylaşılabilecek doğal bir tweet üret. Açıklama detayındaki somut bilgiyi bir kez, sade biçimde anlat; başlığı tekrar etme, cümleleri uzatma ve resmî bülten/yapay zekâ tonu kullanma. Konuya uygun tek emoji kullan. Yatırım tavsiyesi, tahmin, abartı veya uydurma bilgi ekleme. İlgili her hisse kodunu # etiketiyle, ayrıca #borsa ve #bist etiketlerini kesinlikle yaz. KAP bağlantısı veya başka URL yazma. Kesinlikle başlık, 'Tweet:', 'Taslak:', açıklama, tırnak işareti veya alternatif sürüm yazma; yalnızca paylaşılacak metni döndür.\n\n" + json.dumps({"subject": subject, "summary": summary, "detail": content, "stocks": stock_codes}, ensure_ascii=False)
@@ -142,14 +154,15 @@ def draft(detail):
         try:
             with urlopen(req, timeout=45) as r:
                 result=json.loads(r.read().decode())
+            if result.get("status") != "completed":
+                raise ValueError(f"AI yanıtı tamamlanmadı: {result.get('status')}")
             output = result.get("output_text")
             if not output:
                 output = "".join(part.get("text", "") for item in result.get("output", []) for part in item.get("content", []) if part.get("type") == "output_text")
             if output: return required_tags(tweet_only(output), stock_codes)
             raise ValueError("AI yanıtında metin yok")
         except Exception as error: logging.warning("AI taslağı üretilemedi (%s); yerel taslağa geçiliyor", error)
-    emoji = "⚠️ " if re.search(r"devre kesici|sürekli işleme ara", f"{subject} {summary}", re.I) else "📌 "
-    body = f"{emoji}{codes + ' ' if codes else ''}{subject or summary}"
+    body = f"📌 {codes + ' ' if codes else ''}{subject or summary}"
     extra = content or summary
     return required_tags(tweet_only(body + (f" — {extra}" if extra and extra.lower() != subject.lower() else "")), stock_codes)
 
