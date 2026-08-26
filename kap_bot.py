@@ -34,6 +34,37 @@ class KapClient:
     def disclosures(self, index): return self.get("/disclosures", {"disclosureIndex": index})
     def detail(self, index): return self.get(f"/disclosureDetail/{index}", {"fileType": "data"})
 
+class PublicKapClient:
+    """Reads public, production KAP disclosure pages without MKK credentials."""
+    base = "https://www.kap.org.tr/tr/Bildirim/"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; KAP-Telegram-Bot/1.0)", "Accept": "text/html"}
+
+    def detail(self, index):
+        try:
+            with urlopen(Request(self.base + str(index), headers=self.headers), timeout=30) as response:
+                source = response.read().decode("utf-8", "replace")
+        except HTTPError as error:
+            if error.code == 404: return None
+            raise
+        # KAP's Next.js page embeds the disclosure in escaped HTML/JSON.
+        source = html.unescape(source.replace("\\u003c", "<").replace("\\u003e", ">").replace("\\\"", '"').replace("\\n", " "))
+        summary = re.search(r'class="disclosureSummary[^>]*>(.*?)</div>', source, re.S)
+        company = re.search(r'Related Companies.*?\[([A-Z0-9.]+)\]', source, re.S)
+        explanation = re.search(r'text-block-value[^>]*>.*?<p[^>]*>(.*?)</p>', source, re.S)
+        sent_at = re.search(r'(\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2})', source)
+        if not summary and not explanation: return None
+        summary_text = clean(summary.group(1) if summary else explanation.group(1))
+        is_circuit = "Devre Kesici" in source or "Circuit Break" in source
+        item = {"disclosureIndex": str(index), "disclosureType": "DKB" if is_circuit else "PUBLIC"}
+        detail = {
+            "subject": {"tr": "Pay Bazında Devre Kesici Bildirimi" if is_circuit else summary_text},
+            "summary": {"tr": summary_text},
+            "relatedStocks": [{"code": company.group(1)}] if company else [],
+            "time": sent_at.group(1) if sent_at else "",
+            "link": self.base + str(index),
+        }
+        return item, detail
+
 class Store:
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -41,10 +72,10 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS disclosures (id INTEGER PRIMARY KEY, important INTEGER NOT NULL, telegram_sent INTEGER NOT NULL DEFAULT 0, title TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
         self.db.commit()
-    def get_cursor(self):
-        row = self.db.execute("SELECT value FROM state WHERE key='cursor'").fetchone(); return int(row[0]) if row else None
-    def set_cursor(self, value):
-        self.db.execute("INSERT INTO state(key,value) VALUES('cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(value),)); self.db.commit()
+    def get_cursor(self, key="cursor"):
+        row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone(); return int(row[0]) if row else None
+    def set_cursor(self, value, key="cursor"):
+        self.db.execute("INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value))); self.db.commit()
     def seen(self, ident): return self.db.execute("SELECT 1 FROM disclosures WHERE id=?", (ident,)).fetchone() is not None
     def save(self, ident, important, title):
         self.db.execute("INSERT OR IGNORE INTO disclosures(id,important,title) VALUES(?,?,?)", (ident, int(important), title)); self.db.commit()
@@ -70,7 +101,7 @@ def draft(detail):
     codes = " ".join(f"#{x}" for x in stocks(detail))
     api_key = cfg("AI_API_KEY")
     if api_key:
-        prompt = "Türkçe borsa gündemini doğal ve akıcı anlatan deneyimli bir editörsün. Verilen KAP bildiriminden en fazla 280 karakterlik, kopyalayıp doğrudan X'te paylaşılabilecek tek bir tweet yaz. Resmî bülten ya da yapay zekâ gibi konuşma; kısa, sade ve doğal piyasa dili kullan. Yatırım tavsiyesi, tahmin, abartı veya uydurma bilgi ekleme. Varsa hisse kodunu # etiketiyle kullan ve KAP bağlantısını metne ekle. Kesinlikle başlık, 'Tweet:', 'Taslak:', açıklama, tırnak işareti veya alternatif sürüm yazma; yalnızca paylaşılacak metni döndür.\n\n" + json.dumps({"subject": subject, "summary": summary, "stocks": stocks(detail), "link": detail.get("link")}, ensure_ascii=False)
+        prompt = "Türkçe borsa gündemini doğal ve akıcı anlatan deneyimli bir editörsün. Verilen KAP bildiriminden en fazla 280 karakterlik, kopyalayıp doğrudan X'te paylaşılabilecek tek bir tweet yaz. Resmî bülten ya da yapay zekâ gibi konuşma; kısa, sade ve doğal piyasa dili kullan. Haberle uyumlu tek bir emoji kullan (örneğin devre kesicide ⚠️); emoji yağmuru yapma. Yatırım tavsiyesi, tahmin, abartı veya uydurma bilgi ekleme. Varsa hisse kodunu # etiketiyle kullan ve KAP bağlantısını metne ekle. Kesinlikle başlık, 'Tweet:', 'Taslak:', açıklama, tırnak işareti veya alternatif sürüm yazma; yalnızca paylaşılacak metni döndür.\n\n" + json.dumps({"subject": subject, "summary": summary, "stocks": stocks(detail), "link": detail.get("link")}, ensure_ascii=False)
         # GPT-5.6 family uses the current Responses API. Its compact output is
         # extracted below without relying on a particular SDK.
         body = json.dumps({"model": cfg("AI_MODEL", "gpt-5.6-luna"), "input":prompt, "max_output_tokens":180, "store":False}).encode()
@@ -84,7 +115,8 @@ def draft(detail):
             if output: return tweet_only(output)
             raise ValueError("AI yanıtında metin yok")
         except Exception as error: logging.warning("AI taslağı üretilemedi (%s); yerel taslağa geçiliyor", error)
-    body = f"{codes + ' ' if codes else ''}{subject or summary}"
+    emoji = "⚠️ " if re.search(r"devre kesici|sürekli işleme ara", f"{subject} {summary}", re.I) else "📌 "
+    body = f"{emoji}{codes + ' ' if codes else ''}{subject or summary}"
     return tweet_only(body + (f" — {summary}" if summary and summary.lower() != subject.lower() else "") + f"\n{detail.get('link','')}")
 
 def telegram_send(text):
@@ -92,6 +124,35 @@ def telegram_send(text):
     if not token or not chat: logging.warning("Telegram ayarları eksik; bildirim atlanıyor"); return False
     data = urlencode({"chat_id":chat, "text":text, "disable_web_page_preview":"true"}).encode()
     with urlopen(Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data), timeout=30) as r: return json.loads(r.read().decode()).get("ok", False)
+
+def deliver(store, ident, item, detail, dry_run):
+    important = is_important(item, detail)
+    store.save(ident, important, text_of(detail.get("subject")))
+    if not important: return 0
+    message = draft(detail)
+    if dry_run: logging.info("DRY RUN:\n%s", message)
+    elif telegram_send(message): logging.info("Telegram gönderildi: %s", ident)
+    return 1
+
+def run_public_once(store, dry_run=False):
+    cursor_key = "public_cursor"
+    cursor = store.get_cursor(cursor_key)
+    if cursor is None:
+        cursor = int(cfg("PUBLIC_INITIAL_INDEX", "0"))
+        if cursor <= 0: raise ValueError("PUBLIC_INITIAL_INDEX pozitif bir KAP bildirim ID'si olmalı")
+        store.set_cursor(cursor, cursor_key)
+        logging.info("Canlı KAP başlangıç imleci: %s", cursor)
+        return 0
+    ident = cursor + 1
+    result = PublicKapClient().detail(ident)
+    if result is None:
+        logging.info("Yeni canlı KAP bildirimi yok (beklenen ID %s)", ident)
+        return 0
+    item, detail = result
+    if not store.seen(ident): count = deliver(store, ident, item, detail, dry_run)
+    else: count = 0
+    store.set_cursor(ident, cursor_key)
+    return count
 
 def run_once(store, dry_run=False):
     client, latest = KapClient(), None
@@ -105,12 +166,7 @@ def run_once(store, dry_run=False):
     for item in client.disclosures(cursor + 1):
         ident = int(item["disclosureIndex"])
         if ident <= cursor or store.seen(ident): continue
-        detail = client.detail(ident); important = is_important(item, detail); store.save(ident, important, text_of(detail.get("subject")))
-        if important:
-            message = draft(detail)
-            if dry_run: logging.info("DRY RUN:\n%s", message)
-            elif telegram_send(message): logging.info("Telegram gönderildi: %s", ident)
-            count += 1
+        detail = client.detail(ident); count += deliver(store, ident, item, detail, dry_run)
         store.set_cursor(ident)
     # The endpoint can return at most a page of disclosures. Advance only to
     # the highest disclosure actually inspected, so a busy period cannot skip IDs.
@@ -124,7 +180,7 @@ def main():
     parser=argparse.ArgumentParser(); parser.add_argument("--once", action="store_true"); parser.add_argument("--dry-run", action="store_true"); args=parser.parse_args()
     store=Store(cfg("DATABASE_PATH", "data/kap_bot.sqlite3"))
     while True:
-        try: run_once(store, args.dry_run)
+        try: run_public_once(store, args.dry_run) if cfg("KAP_SOURCE", "public").lower() == "public" else run_once(store, args.dry_run)
         except (HTTPError, URLError, TimeoutError, KeyError, ValueError): logging.exception("KAP kontrolü başarısız")
         except Exception: logging.exception("Beklenmeyen hata")
         if args.once: break

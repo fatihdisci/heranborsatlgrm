@@ -1,6 +1,6 @@
 # KAP Haber Botu
 
-Mac mini üzerinde 7/24 çalışmak üzere hazırlanmış ilk sürüm. MKK test API'sini periyodik olarak kontrol eder, yeni bildirimleri SQLite'a kaydeder, önemli görünenleri seçer, Türkçe tweet taslağı üretir ve Telegram'a yollar. X'e otomatik paylaşım yapmaz.
+Mac mini üzerinde 7/24 çalışmak üzere hazırlanmış ilk sürüm. KAP'ın herkese açık canlı bildirim sayfalarını periyodik olarak kontrol eder, yeni bildirimleri SQLite'a kaydeder, önemli görünenleri seçer, doğal dilli ve emojili Türkçe tweet metni üretir ve Telegram'a yollar. X'e otomatik paylaşım yapmaz.
 
 ## Klasör yapısı
 
@@ -25,7 +25,7 @@ kap-bot/
    open -e .env
    ```
 
-2. `.env` içine MKK kullanıcı adı/parolasını yazın. Telegram için BotFather'dan alınan token ve hedef `chat_id` değerini ekleyin. AI taslağı için `AI_API_KEY` girin; boş bırakılırsa basit yerel taslak kullanılır.
+2. `.env` içinde `KAP_SOURCE=public` ve `PUBLIC_INITIAL_INDEX` değerini o anki son KAP bildirim ID'si olarak ayarlayın. Telegram için BotFather'dan alınan token ve hedef `chat_id` değerini ekleyin. AI taslağı için `AI_API_KEY` girin; boş bırakılırsa emojili basit yerel taslak kullanılır.
 
 3. Önce bağlantıyı tek sefer test edin:
 
@@ -33,7 +33,7 @@ kap-bot/
    python3 kap_bot.py --once --dry-run
    ```
 
-   İlk çalıştırmada `INITIAL_CURSOR=latest` ise mevcut son ID yalnızca başlangıç noktası olarak kaydedilir; eski test bildirimleri gönderilmez. Yeni bildirimleri denemek için `.env` içinde `INITIAL_CURSOR` değerini test etmek istediğiniz ID'nin bir öncesine ayarlayın.
+   İlk çalıştırmada `PUBLIC_INITIAL_INDEX` yalnızca başlangıç noktası olarak kaydedilir; eski bildirimler gönderilmez. Bot sonraki KAP ID'sini takip eder.
 
 4. Sürekli önizleme:
 
