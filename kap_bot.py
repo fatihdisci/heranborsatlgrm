@@ -46,12 +46,19 @@ class PublicKapClient:
         except HTTPError as error:
             if error.code == 404: return None
             raise
-        # KAP's Next.js page embeds the disclosure in escaped HTML/JSON.
-        source = html.unescape(source.replace("\\u003c", "<").replace("\\u003e", ">").replace("\\\"", '"').replace("\\n", " "))
+        # KAP's Next.js page embeds the disclosure in escaped HTML/JSON. Work
+        # only inside this notification's DOM section; otherwise unrelated
+        # JavaScript or third-party page text can be mistaken for a disclosure.
+        source = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), source)
+        source = html.unescape(source.replace("\\\"", '"').replace("\\n", " "))
+        marker = f"notification-body-scale-{index}"
+        start = source.find(marker)
+        if start < 0: return None
+        source = source[start:]
         summary = re.search(r'class="disclosureSummary[^>]*>(.*?)</div>', source, re.S)
         # Keep the match inside the related-company cell.  A broad match can
         # accidentally pick a later numeric field (for example, "18").
-        company = re.search(r'Related Companies.*?<div class="gwt-Label">\[([A-Z]{2,6}(?:\s*,\s*[A-Z]{2,6})*)\]</div>', source, re.S)
+        company = re.search(r'Related Companies.*?<div class="gwt-Label">\[([A-Z][A-Z0-9]{1,5}(?:\s*,\s*[A-Z][A-Z0-9]{1,5})*)\]</div>', source, re.S)
         explanation = re.search(r'text-block-value[^>]*>.*?<p[^>]*>(.*?)</p>', source, re.S)
         sent_at = re.search(r'(\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2})', source)
         if not summary and not explanation: return None
@@ -82,14 +89,21 @@ class Store:
     def seen(self, ident): return self.db.execute("SELECT 1 FROM disclosures WHERE id=?", (ident,)).fetchone() is not None
     def save(self, ident, important, title):
         self.db.execute("INSERT OR IGNORE INTO disclosures(id,important,title) VALUES(?,?,?)", (ident, int(important), title)); self.db.commit()
+    def telegram_sent(self, ident):
+        row = self.db.execute("SELECT telegram_sent FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
+    def mark_telegram_sent(self, ident):
+        self.db.execute("UPDATE disclosures SET telegram_sent=1 WHERE id=?", (ident,)); self.db.commit()
 
-KEYWORDS = re.compile(r"temettü|bedelli|bedelsiz|sermaye artır|geri alım|ihale|sözleşme|yatırım|kapasite|iş ilişkisi|birleşme|satın alma|finansal sonuç|kâr|zarar|iflas|konkordato|yönetim kurulu|istifa|pay alım|özel durum|devre kesici|sürekli işleme ara|tek fiyat emir toplama", re.I)
+KEYWORDS = re.compile(r"temettü|bedelli|bedelsiz|sermaye artır|geri alım|ihale sonucu|sözleşme imzalan|iş ilişkisi|yatırım projesi|kapasite artış|birleşme|satın alma|finansal sonuç|net kâr|net zarar|iflas|konkordato|geri alım programı|pay alım satım|özel durum|devre kesici|sürekli işleme ara|tek fiyat emir toplama", re.I)
+NOISE = re.compile(r"borsa dışı repo|yatırımcı bilgi formu|yönetim kurulu komiteleri|varant|itfa fiyat|summernote|project|issues", re.I)
 def clean(value):
     text = re.sub(r"<[^>]+>", " ", html.unescape(value or "")); return re.sub(r"\s+", " ", text).strip()
 def text_of(obj, lang="tr"):
     return obj.get(lang) if isinstance(obj, dict) else (obj or "")
 def stocks(detail):
-    return [x.get("code") for x in detail.get("relatedStocks", []) if re.fullmatch(r"[A-Z]{2,6}", x.get("code", ""))]
+    # BIST symbols may contain digits (for example AVGY0), but a number alone
+    # is never a valid symbol and must not become a hashtag such as #18.
+    return [x.get("code") for x in detail.get("relatedStocks", []) if re.fullmatch(r"[A-Z][A-Z0-9]{1,5}", x.get("code", ""))]
 def tweet_only(text):
     """Keep the Telegram payload ready to paste into X, with no meta labels."""
     text = re.sub(r"https?://\S+", "", text, flags=re.I)
@@ -108,10 +122,10 @@ def required_tags(text, codes):
     return (base + suffix).strip()
 def is_important(item, detail):
     joined = " ".join([item.get("disclosureType", ""), text_of(detail.get("subject")), text_of(detail.get("summary")), detail.get("senderTitle", "")])
-    # These notices are not useful as ticker alerts when KAP provides no
-    # related listed company; never invent a numeric or unrelated hashtag.
-    if re.search(r"pay alım satım bildirimi", joined, re.I) and not stocks(detail): return False
-    return item.get("disclosureType") in {"ODA", "CA", "OD", "FR", "DGK", "DKB"} or bool(KEYWORDS.search(joined)) or bool(stocks(detail))
+    # Every published message must identify a real listed company.  This
+    # prevents fund notices, forms and page noise from becoming stock alerts.
+    if not stocks(detail) or NOISE.search(joined): return False
+    return item.get("disclosureType") == "DKB" or bool(KEYWORDS.search(joined))
 
 def draft(detail):
     subject, summary = clean(text_of(detail.get("subject"))), clean(text_of(detail.get("summary")))
@@ -120,7 +134,7 @@ def draft(detail):
     codes = " ".join(f"#{x}" for x in stock_codes)
     api_key = cfg("AI_API_KEY")
     if api_key:
-        prompt = "Türkçe borsa gündemini doğal ve akıcı anlatan deneyimli bir editörsün. Verilen KAP bildiriminden 220-280 karakter aralığında, kopyalayıp doğrudan X'te paylaşılabilecek tek bir tweet yaz. Bildirimin açıklama detayındaki somut bilgileri kullan; resmî bülten ya da yapay zekâ gibi konuşma. Haberle uyumlu tek emoji kullan; emoji yağmuru yapma. Yatırım tavsiyesi, tahmin, abartı veya uydurma bilgi ekleme. İlgili her hisse kodunu # etiketiyle, ayrıca #borsa ve #bist etiketlerini kesinlikle yaz. KAP bağlantısı veya başka URL yazma. Kesinlikle başlık, 'Tweet:', 'Taslak:', açıklama, tırnak işareti veya alternatif sürüm yazma; yalnızca paylaşılacak metni döndür.\n\n" + json.dumps({"subject": subject, "summary": summary, "detail": content, "stocks": stock_codes}, ensure_ascii=False)
+        prompt = "Türkçe borsa gündemini takip eden gerçek bir yatırımcı gibi yaz. Verilen KAP bildiriminden 110-220 karakterlik, tek parça ve doğrudan X'te paylaşılabilecek doğal bir tweet üret. Açıklama detayındaki somut bilgiyi bir kez, sade biçimde anlat; başlığı tekrar etme, cümleleri uzatma ve resmî bülten/yapay zekâ tonu kullanma. Konuya uygun tek emoji kullan. Yatırım tavsiyesi, tahmin, abartı veya uydurma bilgi ekleme. İlgili her hisse kodunu # etiketiyle, ayrıca #borsa ve #bist etiketlerini kesinlikle yaz. KAP bağlantısı veya başka URL yazma. Kesinlikle başlık, 'Tweet:', 'Taslak:', açıklama, tırnak işareti veya alternatif sürüm yazma; yalnızca paylaşılacak metni döndür.\n\n" + json.dumps({"subject": subject, "summary": summary, "detail": content, "stocks": stock_codes}, ensure_ascii=False)
         # GPT-5.6 family uses the current Responses API. Its compact output is
         # extracted below without relying on a particular SDK.
         body = json.dumps({"model": cfg("AI_MODEL", "gpt-5.6-luna"), "input":prompt, "max_output_tokens":180, "store":False}).encode()
@@ -148,10 +162,12 @@ def telegram_send(text):
 def deliver(store, ident, item, detail, dry_run):
     important = is_important(item, detail)
     store.save(ident, important, text_of(detail.get("subject")))
-    if not important: return 0
+    if not important or store.telegram_sent(ident): return 0
     message = draft(detail)
     if dry_run: logging.info("DRY RUN:\n%s", message)
-    elif telegram_send(message): logging.info("Telegram gönderildi: %s", ident)
+    elif telegram_send(message):
+        store.mark_telegram_sent(ident)
+        logging.info("Telegram gönderildi: %s", ident)
     return 1
 
 def run_public_once(store, dry_run=False):
@@ -169,8 +185,7 @@ def run_public_once(store, dry_run=False):
         logging.info("Yeni canlı KAP bildirimi yok (beklenen ID %s)", ident)
         return 0
     item, detail = result
-    if not store.seen(ident): count = deliver(store, ident, item, detail, dry_run)
-    else: count = 0
+    count = deliver(store, ident, item, detail, dry_run)
     store.set_cursor(ident, cursor_key)
     return count
 
