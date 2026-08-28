@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import kap_bot
@@ -29,6 +30,13 @@ class KapBotTests(unittest.TestCase):
     def test_required_tags_removes_urls_and_keeps_ticker(self):
         text = kap_bot.required_tags(kap_bot.tweet_only("Kısa açıklama https://example.com"), ["AVGY0"])
         self.assertEqual(text, "Kısa açıklama #AVGY0 #borsa #bist")
+
+    def test_circuit_card_renders(self):
+        path = kap_bot.render_circuit_card("HEDEF", {"name": "Hedef Holding", "price": 98.8, "change_pct": -5.0, "points": [104, 100, 99, 98.8]})
+        self.assertTrue(Path(path).exists())
+        with Image.open(path) as image:
+            self.assertEqual(image.size, (1200, 675))
+        Path(path).unlink()
 
 
 if __name__ == "__main__":

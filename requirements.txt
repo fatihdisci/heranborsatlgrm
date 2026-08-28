@@ -1,1 +1,1 @@
-# Runtime uses only the Python standard library.
+Pillow>=12.0

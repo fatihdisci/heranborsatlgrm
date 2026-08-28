@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """KAP test API -> important disclosure -> Turkish draft -> Telegram."""
-import argparse, base64, html, json, logging, os, re, sqlite3, time
+import argparse, base64, html, json, logging, os, re, sqlite3, time, tempfile
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent
 
@@ -139,15 +140,84 @@ def telegram_send(text):
     data = urlencode({"chat_id":chat, "text":text, "disable_web_page_preview":"true"}).encode()
     with urlopen(Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data), timeout=30) as r: return json.loads(r.read().decode()).get("ok", False)
 
+def yahoo_chart(code):
+    """Return delayed intraday price data for a BIST symbol from Yahoo Finance."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}.IS?range=1d&interval=5m"
+    with urlopen(Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    result = payload["chart"]["result"][0]
+    meta, quote = result["meta"], result["indicators"]["quote"][0]
+    points = [value for value in quote.get("close", []) if isinstance(value, (int, float))]
+    price = meta.get("regularMarketPrice")
+    previous = meta.get("chartPreviousClose") or meta.get("previousClose")
+    if not isinstance(price, (int, float)) or not isinstance(previous, (int, float)) or not points: raise ValueError("Yahoo fiyat verisi eksik")
+    return {"name": meta.get("longName") or code, "price": price, "change_pct": (price - previous) / previous * 100, "points": points}
+
+def card_font(size, bold=False):
+    paths = [
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
+    ]
+    for path in paths:
+        if Path(path).exists(): return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+def render_circuit_card(code, market):
+    """Create a clean 1200×675 circuit-breaker chart card for Telegram/X."""
+    image = Image.new("RGB", (1200, 675), "#FAFAF8")
+    draw = ImageDraw.Draw(image)
+    dark, muted, red = "#141414", "#747474", "#D65A4A"
+    draw.rounded_rectangle((55, 48, 1145, 625), radius=28, fill="#FFFFFF", outline="#E9E7E2", width=2)
+    draw.text((95, 86), "DEVRE KESİCİ", font=card_font(28, True), fill=red)
+    draw.text((95, 132), code, font=card_font(56, True), fill=dark)
+    draw.text((95, 203), str(market["name"])[:38], font=card_font(25), fill=muted)
+    price = (f"{market['price']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")) + " TL"
+    draw.text((95, 248), price, font=card_font(52, True), fill=dark)
+    change = f"%{market['change_pct']:+.2f}".replace(".", ",")
+    draw.text((360, 268), change, font=card_font(28, True), fill=red if market["change_pct"] < 0 else "#27805C")
+    points = market["points"]
+    low, high = min(points), max(points)
+    left, top, right, bottom = 95, 345, 1105, 530
+    if high == low: high += 1
+    coords = [(left + i * (right-left)/(len(points)-1), bottom - (point-low)/(high-low)*(bottom-top)) for i, point in enumerate(points)] if len(points) > 1 else []
+    if coords: draw.line(coords, fill=red, width=6, joint="curve")
+    draw.line((left, bottom, right, bottom), fill="#ECEAE6", width=2)
+    draw.text((95, 563), "İşlemler tek fiyat yöntemiyle devam ediyor.", font=card_font(21), fill=muted)
+    footer = "@heranborsa"
+    footer_width = draw.textbbox((0, 0), footer, font=card_font(22, True))[2]
+    draw.text((1105-footer_width, 563), footer, font=card_font(22, True), fill=dark)
+    handle = tempfile.NamedTemporaryFile(prefix=f"kap-{code}-", suffix=".png", delete=False)
+    handle.close(); image.save(handle.name, "PNG", optimize=True)
+    return handle.name
+
+def telegram_send_photo(path, caption):
+    token, chat = cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")
+    if not token or not chat: logging.warning("Telegram ayarları eksik; görsel atlanıyor"); return False
+    boundary = "----KapBotBoundary"
+    data = Path(path).read_bytes()
+    body = b"".join([
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat}\r\n".encode(),
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode(),
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"kap-card.png\"\r\nContent-Type: image/png\r\n\r\n".encode(), data, f"\r\n--{boundary}--\r\n".encode(),
+    ])
+    request = Request(f"https://api.telegram.org/bot{token}/sendPhoto", data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urlopen(request, timeout=30) as response: return json.loads(response.read().decode()).get("ok", False)
+
 def deliver(store, ident, item, detail, dry_run):
     important = is_important(item, detail)
     store.save(ident, important, text_of(detail.get("subject")))
     if not important or store.telegram_sent(ident): return 0
     message = draft(detail)
+    card = None
+    try:
+        if item.get("disclosureType") == "DKB": card = render_circuit_card(stocks(detail)[0], yahoo_chart(stocks(detail)[0]))
+    except Exception as error:
+        logging.warning("Devre kesici görseli üretilemedi (%s); sade metin gönderiliyor", error)
     if dry_run: logging.info("DRY RUN:\n%s", message)
-    elif telegram_send(message):
+    elif (telegram_send_photo(card, message) if card else telegram_send(message)):
         store.mark_telegram_sent(ident)
         logging.info("Telegram gönderildi: %s", ident)
+    if card: Path(card).unlink(missing_ok=True)
     return 1
 
 def run_public_once(store, dry_run=False):

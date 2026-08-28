@@ -1,5 +1,6 @@
 .env
 data/*.sqlite3
+data/cards/
 logs/
 __pycache__/
 *.pyc
