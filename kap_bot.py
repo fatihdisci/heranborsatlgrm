@@ -55,6 +55,9 @@ class PublicKapClient:
         # JavaScript or third-party page text can be mistaken for a disclosure.
         source = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), source)
         source = html.unescape(source.replace("\\\"", '"').replace("\\n", " "))
+        # This machine-readable field is before the rendered notification DOM.
+        own_stock = re.search(r'"stockCode"\s*:\s*"([A-Z][A-Z0-9]{1,5})"', source)
+        own_company = re.search(r'"companyTitle"\s*:\s*"([^"]+)"', source)
         marker = f"notification-body-scale-{index}"
         start = source.find(marker)
         if start < 0: return None
@@ -63,6 +66,8 @@ class PublicKapClient:
         # Keep the match inside the related-company cell.  A broad match can
         # accidentally pick a later numeric field (for example, "18").
         company = re.search(r'Related Companies.*?<div class="gwt-Label">\[([A-Z][A-Z0-9]{1,5}(?:\s*,\s*[A-Z][A-Z0-9]{1,5})*)\]</div>', source, re.S)
+        # Many company disclosures leave "Related Companies" empty. Their
+        # own BIST code is used as the safe fallback.
         explanation = re.search(r'text-block-value[^>]*>.*?<p[^>]*>(.*?)</p>', source, re.S)
         sent_at = re.search(r'(\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2})', source)
         if not summary and not explanation: return None
@@ -73,9 +78,10 @@ class PublicKapClient:
             "subject": {"tr": "Pay Bazında Devre Kesici Bildirimi" if is_circuit else summary_text},
             "summary": {"tr": summary_text},
             "content": {"tr": clean(explanation.group(1)) if explanation else ""},
-            "relatedStocks": [{"code": code.strip()} for code in company.group(1).split(",")] if company else [],
+            "relatedStocks": [{"code": code.strip()} for code in company.group(1).split(",")] if company else ([{"code": own_stock.group(1)}] if own_stock else []),
             "time": sent_at.group(1) if sent_at else "",
             "link": self.base + str(index),
+            "senderTitle": clean(own_company.group(1)) if own_company else "",
         }
         return item, detail
 
@@ -104,12 +110,12 @@ class Store:
     def mark_x_posted(self, ident, post_id):
         self.db.execute("UPDATE disclosures SET x_post_id=? WHERE id=?", (str(post_id), ident)); self.db.commit()
 
-KEYWORDS = re.compile(r"temettü|bedelli|bedelsiz|sermaye artır|geri alım|ihale sonucu|sözleşme imzalan|iş ilişkisi|yatırım projesi|kapasite artış|birleşme|satın alma|finansal sonuç|net kâr|net zarar|iflas|konkordato|geri alım programı|pay alım satım|özel durum|devre kesici|sürekli işleme ara|tek fiyat emir toplama|faaliyet.*durdur|imkansız hale", re.I)
+KEYWORDS = re.compile(r"temettü|bedelli|bedelsiz|sermaye artır|geri alım|ihale sonucu|sözleşme\w*\s+imzalan|iş ilişkisi|yatırım projesi|kapasite artış|birleşme|satın alma|finansal sonuç|net kâr|net zarar|iflas|konkordato|geri alım programı|pay alım satım|özel durum|devre kesici|sürekli işleme ara|tek fiyat emir toplama|faaliyet.*durdur|imkansız hale", re.I)
 NOISE = re.compile(r"borsa dışı repo|yatırımcı bilgi formu|yönetim kurulu komiteleri|varant|itfa fiyat|summernote|project|issues", re.I)
 SPECIAL_EVENTS = (
     ("circuit", "DEVRE KESİCİ", re.compile(r"devre kesici|sürekli işleme ara|tek fiyat emir toplama", re.I)),
     ("buyback", "PAY GERİ ALIMI", re.compile(r"payların geri alınması|pay geri alım|geri alınan pay", re.I)),
-    ("business", "YENİ İŞ İLİŞKİSİ", re.compile(r"yeni iş ilişkisi|sözleşme imzalanması|ihale sonucu", re.I)),
+    ("business", "YENİ İŞ İLİŞKİSİ", re.compile(r"yeni\s+iş\s+ilişki\w*|sözleşme\w*\s+imzalan\w*|ihale\w*\s+(sonuç|kazan)", re.I)),
     ("share_trade", "PAY ALIM SATIMI", re.compile(r"pay alım satım bildirimi|pay satış bildirimi|sermaye piyasası aracı alım satım", re.I)),
     ("suspension", "FAALİYET DURDURMA", re.compile(r"faaliyetlerin kısmen veya tamamen durdurulması|faaliyet.*durdurul|imkansız hale", re.I)),
 )
@@ -172,6 +178,57 @@ def event_tweet(event, detail):
     body = f"{titles[event]}: {summary_line(detail, 180)}"
     return required_tags(tweet_only(body), codes)
 
+AI_TWEET_PROMPT = """Sen Her An Borsa için Türkçe KAP editörüsün.
+Verilen KAP verisini doğal, kısa ve haber diliyle tek bir tweet metnine dönüştür.
+Haberin ana odağı kesin olarak KONU ve ÖZET alanlarıdır. Açıklama içindeki önceki KAP'lara, tarihçeye veya arka plan bilgisine yalnızca KONU/ÖZET'i doğrudan destekliyorsa yer ver; bunları asla ana haber yapma.
+Sadece kaynakta yer alan somut bilgileri kullan; rakam, tarih, şirket, sözleşme veya oran uydurma.
+Hukuki tekrarları, standart sorumluluk metinlerini ve gereksiz girişleri çıkar.
+Yatırım tavsiyesi, yorum, kaynak linki, başlık, tırnak işareti veya 'tweet metni' gibi etiket ekleme.
+Metin sade, insan yazmış gibi ve en fazla iki kısa cümle olsun. Hedef uzunluk 180 karakterdir."""
+
+def response_text(payload):
+    """Extract plain text from OpenAI Responses or chat-completions compatible output."""
+    if isinstance(payload.get("output_text"), str): return payload["output_text"]
+    for output in payload.get("output", []):
+        for content in output.get("content", []):
+            if content.get("type") in {"output_text", "text"} and isinstance(content.get("text"), str): return content["text"]
+    choices = payload.get("choices", [])
+    if choices:
+        message = choices[0].get("message", {})
+        if isinstance(message.get("content"), str): return message["content"]
+    return ""
+
+def finalise_ai_tweet(text, codes):
+    return required_tags(tweet_only(text), codes)
+
+def ai_tweet(detail, event=None):
+    """Ask the configured Responses API for a concise factual Turkish tweet."""
+    key = cfg("AI_API_KEY")
+    if not key: return None
+    context = "\n".join([
+        f"Konu: {clean(text_of(detail.get('subject')))}",
+        f"Özet: {clean(text_of(detail.get('summary')))}",
+        f"Açıklama: {clean(text_of(detail.get('content')))[:6000]}",
+        f"İlgili hisseler: {', '.join(stocks(detail))}",
+        f"Olay türü: {event or 'önemli KAP bildirimi'}",
+    ])
+    payload = {
+        "model": cfg("AI_MODEL", "gpt-5-mini"),
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": AI_TWEET_PROMPT}]},
+            {"role": "user", "content": [{"type": "input_text", "text": context}]},
+        ],
+        "max_output_tokens": 180,
+    }
+    base_url = cfg("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    request = Request(f"{base_url}/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(request, timeout=45) as response: text = response_text(json.loads(response.read().decode("utf-8")))
+    except Exception as error:
+        logging.warning("AI tweet üretilemedi (%s); kısa metin kullanılacak", type(error).__name__)
+        return None
+    return finalise_ai_tweet(text, stocks(detail)) if text else None
+
 def telegram_send(text):
     token, chat = cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")
     if not token or not chat: logging.warning("Telegram ayarları eksik; bildirim atlanıyor"); return False
@@ -224,6 +281,39 @@ def wrap_card_text(draw, text, font, max_width, max_lines):
     if line and len(lines) < max_lines: lines.append(line)
     return lines
 
+def display_company(detail):
+    title = clean(detail.get("senderTitle", ""))
+    # Legal titles are generally much too long for an editorial company line.
+    # Stop before the first sector/legal descriptor, leaving the recognisable
+    # company name (for example, "BİRLEŞİM MÜHENDİSLİK").
+    title = re.sub(r"\s+(SANAYİ|TİCARET|ÜRETİM|HİZMETLERİ|YATIRIM|ISITMA|SOĞUTMA|HAVALANDIRMA|İNŞAAT|ELEKTRİK|VE)\b.*$", "", title, flags=re.I).strip()
+    return title or " ".join(stocks(detail))
+
+def card_amount(detail):
+    text = disclosure_text(detail)
+    match = re.search(r"\b\d{1,3}(?:[.]\d{3})+(?:,\d+)?\s*(?:TL|USD|EUR)\b|\b\d+(?:[.,]\d+)?\s*(?:milyon|milyar)\s*(?:TL|USD|EUR)\b", text, re.I)
+    return match.group(0) if match else ""
+
+def card_project(detail):
+    text = disclosure_text(detail)
+    match = re.search(r"([^.]{5,130}?\bProjesi)\b", text)
+    if not match: return ""
+    # A KAP sentence often introduces the project after a comma ("..., İstanbul
+    # ... Projesi kapsamında").  Keeping only that clause avoids displaying
+    # the disclosure's generic lead-in as if it were the project name.
+    project = re.split(r"[,;:]", clean(match.group(1)))[-1].strip()
+    return project if len(project) >= 8 else ""
+
+def event_headline(label):
+    """Use the deliberate two-line hierarchy of the supplied reference card."""
+    layouts = {
+        "YENİ İŞ İLİŞKİSİ": ("YENİ İŞ", "İLİŞKİSİ"),
+        "PAY GERİ ALIMI": ("PAY GERİ", "ALIMI"),
+        "PAY ALIM SATIMI": ("PAY ALIM", "SATIMI"),
+        "FAALİYET DURDURMA": ("FAALİYET", "DURDURMA"),
+    }
+    return list(layouts.get(label, (label,)))
+
 def render_circuit_card(code, market):
     """Create a branded horizontal 1200×675 circuit-breaker card."""
     image = translucent_panel(card_background("dkb-background.jpg", (1200, 675)), (55, 48, 1145, 610), 218)
@@ -249,24 +339,34 @@ def render_circuit_card(code, market):
     return handle.name
 
 def render_event_card(event, label, detail):
-    """Render a branded vertical 1080×1920 card for high-signal KAP events."""
+    """Render a direct, editorial vertical card on the supplied brand texture."""
     codes = stocks(detail)
-    image = translucent_panel(card_background("event-background.jpg", (1080, 1920)), (54, 70, 1026, 1580), 220)
+    image = card_background("event-background.jpg", (720, 1280))
     draw = ImageDraw.Draw(image)
-    accent = {"buyback": "#3B82C4", "business": "#27805C", "share_trade": "#9C6BDB", "suspension": "#D65A4A"}[event]
-    badge_width = max(305, draw.textbbox((0, 0), label, font=card_font(30, True))[2] + 72)
-    draw.rounded_rectangle((105, 145, 105 + badge_width, 210), radius=16, fill=accent)
-    draw.text((138, 160), label, font=card_font(30, True), fill="#FFFFFF")
-    code_font = card_font(76, True)
-    code_lines = wrap_card_text(draw, "  ".join(f"#{code}" for code in codes), code_font, 840, 2)
-    for index, line in enumerate(code_lines): draw.text((105, 280 + index * 90), line, font=code_font, fill="#141414")
-    summary_font = card_font(48)
-    summary = summary_line(detail, 390)
-    lines = wrap_card_text(draw, summary, summary_font, 840, 7)
-    summary_y = 505 if len(code_lines) == 1 else 590
-    for index, line in enumerate(lines): draw.text((105, summary_y + index * 67), line, font=summary_font, fill="#292929")
-    draw.line((105, 1480, 975, 1480), fill="#D9D7D2", width=2)
-    draw.text((105, 1518), "KAP BİLDİRİMİ", font=card_font(28, True), fill="#747474")
+    dark, muted, gold = "#111111", "#5D5D5D", "#A16C0B"
+    headline_font = card_font(48, True)
+    headline_lines = event_headline(label)
+    for index, line in enumerate(headline_lines): draw.text((56, 95 + index * 55), line, font=headline_font, fill=dark)
+    y = 95 + len(headline_lines) * 60 + 24
+    draw.text((56, y), "  ".join(f"#{code}" for code in codes), font=card_font(31, True), fill=gold)
+    y += 52
+    draw.text((56, y), display_company(detail)[:42], font=card_font(23), fill=muted)
+    y += 64
+    summary_font = card_font(30)
+    lines = wrap_card_text(draw, summary_line(detail, 330), summary_font, 610, 7)
+    for index, line in enumerate(lines): draw.text((56, y + index * 37), line, font=summary_font, fill="#202020")
+    y += len(lines) * 37 + 40
+    project, amount = card_project(detail), card_amount(detail)
+    if project and y < 910:
+        draw.text((56, y), "PROJE", font=card_font(20, True), fill="#7D7D7D")
+        y += 26
+        for index, line in enumerate(wrap_card_text(draw, project, card_font(27, True), 610, 2)):
+            draw.text((56, y + index * 31), line, font=card_font(27, True), fill=dark)
+        y += 83
+    if amount and y < 1030:
+        label_text = "SÖZLEŞME TUTARI" if event == "business" else "AÇIKLANAN TUTAR"
+        draw.text((56, y), label_text, font=card_font(20, True), fill="#7D7D7D")
+        draw.text((56, y + 28), amount, font=card_font(45, True), fill=gold)
     handle = tempfile.NamedTemporaryFile(prefix=f"kap-{event}-", suffix=".png", delete=False)
     handle.close(); image.save(handle.name, "PNG", optimize=True)
     return handle.name
@@ -435,18 +535,21 @@ def deliver(store, ident, item, detail, dry_run):
     if not important: return 0
     event = special_event(detail)
     is_circuit = event is not None and event[0] == "circuit"
-    message = event_tweet(event[0], detail) if event else draft(detail)
+    fallback = event_tweet(event[0], detail) if event else draft(detail)
+    message = fallback if is_circuit else (ai_tweet(detail, event[0] if event else None) or fallback)
     card = None
     try:
         if is_circuit: card = render_circuit_card(stocks(detail)[0], yahoo_chart(stocks(detail)[0]))
         elif event: card = render_event_card(event[0], event[1], detail)
     except Exception as error:
-        logging.warning("Devre kesici görseli üretilemedi (%s); sade metin gönderiliyor", error)
+        logging.warning("KAP görseli üretilemedi (%s); sade metin gönderiliyor", error)
     if dry_run: logging.info("DRY RUN:\n%s", message)
     elif not store.telegram_sent(ident) and (telegram_send_photo(card, message) if card else telegram_send(message)):
         store.mark_telegram_sent(ident)
         logging.info("Telegram gönderildi: %s", ident)
-    if card and cfg("X_AUTO_POST_DKB", "false").lower() == "true" and not store.x_posted(ident) and not dry_run:
+    # Even if this explicit switch is enabled later, only circuit breakers may
+    # be posted automatically. All other KAP cards remain Telegram-only.
+    if is_circuit and card and cfg("X_AUTO_POST_DKB", "false").lower() == "true" and not store.x_posted(ident) and not dry_run:
         try:
             post_id = x_post_circuit_breaker(stocks(detail)[0], card)
             store.mark_x_posted(ident, post_id)

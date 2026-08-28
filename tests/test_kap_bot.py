@@ -13,6 +13,10 @@ class KapBotTests(unittest.TestCase):
         detail = {"relatedStocks": [{"code": "AVGY0"}, {"code": "18"}]}
         self.assertEqual(kap_bot.stocks(detail), ["AVGY0"])
 
+    def test_stock_validation_uses_company_stock_code_fallback(self):
+        detail = {"relatedStocks": [{"code": "MAGEN"}]}
+        self.assertEqual(kap_bot.stocks(detail), ["MAGEN"])
+
     def test_noise_is_not_alerted(self):
         item = {"disclosureType": "PUBLIC"}
         detail = {"subject": {"tr": "Borsa Dışı Repo Sözleşmesi"}, "summary": {"tr": "Fon bildirimi"}, "relatedStocks": [{"code": "DOV"}]}
@@ -42,15 +46,30 @@ class KapBotTests(unittest.TestCase):
             detail = {"subject": {"tr": title}, "summary": {"tr": "Önemli KAP açıklaması"}, "relatedStocks": [{"code": "TEST"}]}
             self.assertEqual(kap_bot.special_event(detail)[0], expected)
 
+    def test_business_contract_inflections_are_selected(self):
+        detail = {"subject": {"tr": "Jeotermal Sondaj Hizmetleri Sözleşmesinin İmzalanması Hk."}, "relatedStocks": [{"code": "KPEKS"}]}
+        self.assertEqual(kap_bot.special_event(detail), ("business", "YENİ İŞ İLİŞKİSİ"))
+
     def test_event_tweet_keeps_ticker_and_market_tags(self):
         detail = {"subject": {"tr": "Yeni İş İlişkisi"}, "summary": {"tr": "Şirket sözleşme imzaladı."}, "relatedStocks": [{"code": "BRLSM"}]}
         self.assertEqual(kap_bot.event_tweet("business", detail), "Yeni iş ilişkisi: Şirket sözleşme imzaladı. #BRLSM #borsa #bist")
 
+    def test_ai_tweet_finalizer_removes_link_and_keeps_tags(self):
+        result = kap_bot.finalise_ai_tweet("Şirket sözleşme imzaladı. https://example.com", ["BRLSM"])
+        self.assertEqual(result, "Şirket sözleşme imzaladı. #BRLSM #borsa #bist")
+
     def test_event_card_renders(self):
-        detail = {"summary": {"tr": "Şirket yeni bir iş ilişkisi açıkladı."}, "relatedStocks": [{"code": "BRLSM"}]}
+        detail = {"summary": {"tr": "Şirket yeni bir iş ilişkisi açıkladı."}, "senderTitle": "BİRLEŞİM MÜHENDİSLİK ISITMA SOĞUTMA HAVALANDIRMA SANAYİ VE TİCARET A.Ş.", "relatedStocks": [{"code": "BRLSM"}]}
         path = kap_bot.render_event_card("business", "YENİ İŞ İLİŞKİSİ", detail)
-        with Image.open(path) as image: self.assertEqual(image.size, (1080, 1920))
+        with Image.open(path) as image: self.assertEqual(image.size, (720, 1280))
         Path(path).unlink()
+
+    def test_project_name_omits_generic_disclosure_lead_in(self):
+        detail = {"summary": {"tr": "Şirket ve bağlı ortaklık, İstanbul Uluslararası Finans Merkezi Borsa Binası Projesi kapsamında sözleşme imzaladı."}}
+        self.assertEqual(kap_bot.card_project(detail), "İstanbul Uluslararası Finans Merkezi Borsa Binası Projesi")
+
+    def test_editorial_headline_uses_reference_layout(self):
+        self.assertEqual(kap_bot.event_headline("YENİ İŞ İLİŞKİSİ"), ["YENİ İŞ", "İLİŞKİSİ"])
 
     def test_branded_backgrounds_are_available(self):
         self.assertTrue((kap_bot.ASSETS / "dkb-background.jpg").exists())
