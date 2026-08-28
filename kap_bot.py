@@ -142,6 +142,10 @@ def draft(detail):
     codes = " ".join(f"#{code}" for code in stocks(detail))
     return "\n".join(part for part in (codes, title, detail.get("link", "")) if part)
 
+def circuit_tweet(code):
+    """The ready-to-post text paired with every circuit-breaker card."""
+    return f"#{code} Devre kesti. #borsa #bist"
+
 def telegram_send(text):
     token, chat = cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")
     if not token or not chat: logging.warning("Telegram ayarları eksik; bildirim atlanıyor"); return False
@@ -360,10 +364,11 @@ def deliver(store, ident, item, detail, dry_run):
     important = is_important(item, detail)
     store.save(ident, important, text_of(detail.get("subject")))
     if not important: return 0
-    message = draft(detail)
+    is_circuit = item.get("disclosureType") == "DKB"
+    message = circuit_tweet(stocks(detail)[0]) if is_circuit else draft(detail)
     card = None
     try:
-        if item.get("disclosureType") == "DKB": card = render_circuit_card(stocks(detail)[0], yahoo_chart(stocks(detail)[0]))
+        if is_circuit: card = render_circuit_card(stocks(detail)[0], yahoo_chart(stocks(detail)[0]))
     except Exception as error:
         logging.warning("Devre kesici görseli üretilemedi (%s); sade metin gönderiliyor", error)
     if dry_run: logging.info("DRY RUN:\n%s", message)

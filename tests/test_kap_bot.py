@@ -28,6 +28,9 @@ class KapBotTests(unittest.TestCase):
         detail["link"] = "https://www.kap.org.tr/tr/Bildirim/1655131"
         self.assertEqual(kap_bot.draft(detail), "#IHAAS\nPay Bazında Devre Kesici Bildirimi\nhttps://www.kap.org.tr/tr/Bildirim/1655131")
 
+    def test_circuit_tweet_is_short_and_ready_to_post(self):
+        self.assertEqual(kap_bot.circuit_tweet("HEDEF"), "#HEDEF Devre kesti. #borsa #bist")
+
     def test_required_tags_removes_urls_and_keeps_ticker(self):
         text = kap_bot.required_tags(kap_bot.tweet_only("Kısa açıklama https://example.com"), ["AVGY0"])
         self.assertEqual(text, "Kısa açıklama #AVGY0 #borsa #bist")
