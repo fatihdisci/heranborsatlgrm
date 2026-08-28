@@ -232,8 +232,22 @@ def event_tweet(event, detail):
     return required_tags(tweet_only(event_summary(detail, event, 220)), codes)
 
 def factual_tweet(detail, event=None):
-    """Safe non-AI fallback: a real sentence from the disclosure body."""
-    return required_tags(tweet_only(event_summary(detail, event, 220)), stocks(detail))
+    """Safe non-AI fallback with a complete sentence and a stable opening."""
+    codes = stocks(detail)
+    content = clean(text_of(detail.get("content")))
+    if event == "business":
+        date = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", content)
+        quoted = re.search(r"[\"“]([^\"”]{10,140}?Sözleşmesi)[\"”]", content, re.I)
+        if quoted:
+            company = f"#{codes[0]}" if codes else "Şirket"
+            when = f" {date.group(0)} tarihinde" if date else ""
+            body = f"{company},{when} {quoted.group(1)} imzaladı."
+            ratio = re.search(r"hasılatın\s+(%\d+)['’]?i.*?(%\d+)['’]?u.*?(?:ait|olacak)", content, re.I)
+            if ratio: body += f" Hasılatın {ratio.group(1)}'i şirkete, {ratio.group(2)}'u arsa sahiplerine ait olacak."
+            return required_tags(tweet_only(body), codes)
+    body = event_summary(detail, event, 220)
+    prefix = f"#{codes[0]} " if codes and not body.startswith("#") else ""
+    return required_tags(tweet_only(prefix + body), codes)
 
 AI_TWEET_PROMPT = """Sen Her An Borsa için Türkçe KAP editörüsün.
 Verilen KAP verisini doğal, kısa ve haber diliyle tek bir tweet metnine dönüştür.
@@ -284,7 +298,16 @@ def ai_tweet(detail, event=None):
     except Exception as error:
         logging.warning("AI tweet üretilemedi (%s); kısa metin kullanılacak", type(error).__name__)
         return None
-    return finalise_ai_tweet(text, stocks(detail)) if text else None
+    if not text: return None
+    result = finalise_ai_tweet(text, stocks(detail))
+    # A truncated/fragmented response must never reach Telegram.  Valid AI
+    # drafts start as a normal sentence or with a ticker and contain enough
+    # prose to be more than a title fragment.
+    body = re.sub(r"#(?:[A-Z][A-Z0-9]{1,5}|borsa|bist)\b", "", result, flags=re.I).strip()
+    if len(body) < 35 or (not body.startswith("#") and not body[0].isupper()):
+        logging.warning("AI tweet eksik veya kesik; içerik tabanlı yedek kullanılacak")
+        return None
+    return result
 
 def telegram_send(text):
     token, chat = cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")

@@ -68,6 +68,16 @@ class KapBotTests(unittest.TestCase):
         self.assertIn("10 kuyu", result)
         self.assertIn("sözleşmesi imzalanmıştır", result)
 
+    def test_business_fallback_rewrites_quoted_contract_without_mid_sentence_cut(self):
+        detail = {
+            "content": {"tr": "Taşınmaz üzerinde ticarethane/iş yeri nitelikli proje geliştirilmesi amacıyla arsa sahipleri ile 28.08.2026 tarihinde \"Arsa Satışı Karşılığı Gelir Paylaşımı Sözleşmesi\" imzalanmıştır. Sözleşmeye göre, projeden elde edilecek hasılatın %70'i Şirketimize, %30'u arsa sahiplerine ait olacaktır."},
+            "relatedStocks": [{"code": "ZRGYO"}],
+        }
+        result = kap_bot.factual_tweet(detail, "business")
+        self.assertTrue(result.startswith("#ZRGYO, 28.08.2026 tarihinde Arsa Satışı Karşılığı Gelir Paylaşımı Sözleşmesi imzaladı."))
+        self.assertIn("%70'i şirkete", result)
+        self.assertIn("%30'u arsa sahiplerine", result)
+
     def test_ai_tweet_finalizer_removes_link_and_keeps_tags(self):
         result = kap_bot.finalise_ai_tweet("Şirket sözleşme imzaladı. https://example.com", ["BRLSM"])
         self.assertEqual(result, "Şirket sözleşme imzaladı. #BRLSM #borsa #bist")
