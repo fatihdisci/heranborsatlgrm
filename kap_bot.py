@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """KAP test API -> important disclosure -> Turkish draft -> Telegram."""
-import argparse, base64, html, json, logging, os, re, sqlite3, time, tempfile
+import argparse, base64, hashlib, hmac, html, json, os, re, secrets, sqlite3, time, tempfile, webbrowser
+import logging
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from PIL import Image, ImageDraw, ImageFont
 
@@ -82,6 +84,8 @@ class Store:
         self.db = sqlite3.connect(path)
         self.db.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS disclosures (id INTEGER PRIMARY KEY, important INTEGER NOT NULL, telegram_sent INTEGER NOT NULL DEFAULT 0, title TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(disclosures)")}
+        if "x_post_id" not in columns: self.db.execute("ALTER TABLE disclosures ADD COLUMN x_post_id TEXT")
         self.db.commit()
     def get_cursor(self, key="cursor"):
         row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone(); return int(row[0]) if row else None
@@ -94,6 +98,10 @@ class Store:
         row = self.db.execute("SELECT telegram_sent FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
     def mark_telegram_sent(self, ident):
         self.db.execute("UPDATE disclosures SET telegram_sent=1 WHERE id=?", (ident,)); self.db.commit()
+    def x_posted(self, ident):
+        row = self.db.execute("SELECT x_post_id FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
+    def mark_x_posted(self, ident, post_id):
+        self.db.execute("UPDATE disclosures SET x_post_id=? WHERE id=?", (str(post_id), ident)); self.db.commit()
 
 KEYWORDS = re.compile(r"temettü|bedelli|bedelsiz|sermaye artır|geri alım|ihale sonucu|sözleşme imzalan|iş ilişkisi|yatırım projesi|kapasite artış|birleşme|satın alma|finansal sonuç|net kâr|net zarar|iflas|konkordato|geri alım programı|pay alım satım|özel durum|devre kesici|sürekli işleme ara|tek fiyat emir toplama", re.I)
 NOISE = re.compile(r"borsa dışı repo|yatırımcı bilgi formu|yönetim kurulu komiteleri|varant|itfa fiyat|summernote|project|issues", re.I)
@@ -203,10 +211,158 @@ def telegram_send_photo(path, caption):
     request = Request(f"https://api.telegram.org/bot{token}/sendPhoto", data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     with urlopen(request, timeout=30) as response: return json.loads(response.read().decode()).get("ok", False)
 
+def oauth_quote(value): return quote(str(value), safe="~")
+
+def x_oauth_header(method, url):
+    key, secret = cfg("X_API_KEY"), cfg("X_API_KEY_SECRET")
+    token, token_secret = cfg("X_ACCESS_TOKEN"), cfg("X_ACCESS_TOKEN_SECRET")
+    if not all((key, secret, token, token_secret)): raise ValueError("X API anahtarları eksik")
+    oauth = {
+        "oauth_consumer_key": key, "oauth_nonce": secrets.token_hex(16),
+        "oauth_signature_method": "HMAC-SHA1", "oauth_timestamp": str(int(time.time())),
+        "oauth_token": token, "oauth_version": "1.0",
+    }
+    parsed = urlparse(url)
+    pairs = parse_qsl(parsed.query, keep_blank_values=True) + list(oauth.items())
+    encoded = "&".join(f"{oauth_quote(k)}={oauth_quote(v)}" for k, v in sorted(pairs, key=lambda pair: (oauth_quote(pair[0]), oauth_quote(pair[1]))))
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    base = "&".join((method.upper(), oauth_quote(base_url), oauth_quote(encoded)))
+    signing_key = f"{oauth_quote(secret)}&{oauth_quote(token_secret)}"
+    oauth["oauth_signature"] = base64.b64encode(hmac.new(signing_key.encode(), base.encode(), hashlib.sha1).digest()).decode()
+    return "OAuth " + ", ".join(f'{oauth_quote(k)}="{oauth_quote(v)}"' for k, v in sorted(oauth.items()))
+
+_x_oauth2_access_token = None
+
+def x_bearer_token():
+    """Use the short-lived OAuth 2 token when supplied, else OAuth 1.0a."""
+    global _x_oauth2_access_token
+    if _x_oauth2_access_token is None:
+        _x_oauth2_access_token = cfg("X_OAUTH2_ACCESS_TOKEN")
+    return _x_oauth2_access_token
+
+def update_env_secret(key, value):
+    """Persist a rotated OAuth token locally; .env is intentionally ignored."""
+    path = ROOT / ".env"
+    lines = path.read_text().splitlines() if path.exists() else []
+    pattern = re.compile(rf"^{re.escape(key)}=")
+    replacement = f"{key}={value}"
+    replaced = False
+    for index, line in enumerate(lines):
+        if pattern.match(line):
+            lines[index], replaced = replacement, True
+            break
+    if not replaced: lines.append(replacement)
+    path.write_text("\n".join(lines) + "\n")
+    path.chmod(0o600)
+
+def refresh_x_oauth2_token():
+    """Refresh OAuth 2 credentials and retain the rotating refresh token."""
+    refresh_token, client_id = cfg("X_OAUTH2_REFRESH_TOKEN"), cfg("X_OAUTH2_CLIENT_ID")
+    if not refresh_token or not client_id: raise ValueError("X OAuth 2 yenileme ayarları eksik")
+    body = {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": client_id}
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "heranborsa-kap-bot/1.0"}
+    client_secret = cfg("X_OAUTH2_CLIENT_SECRET")
+    if client_secret:
+        basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        headers["Authorization"] = f"Basic {basic}"
+    request = Request("https://api.x.com/2/oauth2/token", data=urlencode(body).encode(), headers=headers, method="POST")
+    with urlopen(request, timeout=30) as response: result = json.loads(response.read().decode("utf-8"))
+    global _x_oauth2_access_token
+    _x_oauth2_access_token = result["access_token"]
+    update_env_secret("X_OAUTH2_ACCESS_TOKEN", result["access_token"])
+    if result.get("refresh_token"):
+        update_env_secret("X_OAUTH2_REFRESH_TOKEN", result["refresh_token"])
+    return _x_oauth2_access_token
+
+def x_oauth2_token_request(payload):
+    """Exchange or refresh user-context OAuth 2 credentials."""
+    client_id = cfg("X_OAUTH2_CLIENT_ID")
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "heranborsa-kap-bot/1.0"}
+    client_secret = cfg("X_OAUTH2_CLIENT_SECRET")
+    if client_secret:
+        basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        headers["Authorization"] = f"Basic {basic}"
+    request = Request("https://api.x.com/2/oauth2/token", data=urlencode(payload).encode(), headers=headers, method="POST")
+    with urlopen(request, timeout=30) as response: return json.loads(response.read().decode("utf-8"))
+
+def x_authorization_url(redirect_uri, state, verifier):
+    client_id = cfg("X_OAUTH2_CLIENT_ID")
+    if not client_id: raise ValueError("X_OAUTH2_CLIENT_ID eksik")
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    params = {
+        "response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri,
+        "scope": "tweet.read tweet.write users.read offline.access media.write",
+        "state": state, "code_challenge": challenge, "code_challenge_method": "S256",
+    }
+    return "https://twitter.com/i/oauth2/authorize?" + urlencode(params)
+
+def authorize_x_oauth2():
+    """Run once locally to obtain an OAuth 2 *user-context* token for X."""
+    redirect_uri = cfg("X_OAUTH2_REDIRECT_URI", "http://127.0.0.1:8787/callback")
+    parsed = urlparse(redirect_uri)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"} or not parsed.port:
+        raise ValueError("X_OAUTH2_REDIRECT_URI yerel http://127.0.0.1:PORT/callback olmalı")
+    state, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(48)
+    auth_url = x_authorization_url(redirect_uri, state, verifier)
+    received = {}
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            values = dict(parse_qsl(urlparse(self.path).query, keep_blank_values=True))
+            received.update(values)
+            text = "Yetkilendirme alındı. Bu sekmeyi kapatabilirsiniz."
+            self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers(); self.wfile.write(text.encode())
+        def log_message(self, format, *args): pass
+    server = HTTPServer((parsed.hostname, parsed.port), CallbackHandler)
+    server.timeout = 300
+    logging.info("X kullanıcı yetkilendirmesi tarayıcıda açılıyor")
+    webbrowser.open(auth_url)
+    while "code" not in received and "error" not in received:
+        server.handle_request()
+    server.server_close()
+    if received.get("state") != state or received.get("error"):
+        raise ValueError("X kullanıcı yetkilendirmesi tamamlanamadı")
+    result = x_oauth2_token_request({
+        "grant_type": "authorization_code", "code": received["code"],
+        "redirect_uri": redirect_uri, "client_id": cfg("X_OAUTH2_CLIENT_ID"), "code_verifier": verifier,
+    })
+    global _x_oauth2_access_token
+    _x_oauth2_access_token = result["access_token"]
+    update_env_secret("X_OAUTH2_ACCESS_TOKEN", result["access_token"])
+    if result.get("refresh_token"): update_env_secret("X_OAUTH2_REFRESH_TOKEN", result["refresh_token"])
+    return x_verify_identity()
+
+def x_request(method, url, payload=None, retried=False):
+    data = json.dumps(payload).encode() if payload is not None else None
+    bearer = x_bearer_token()
+    headers = {"Authorization": f"Bearer {bearer}" if bearer else x_oauth_header(method, url), "Content-Type": "application/json", "User-Agent": "heranborsa-kap-bot/1.0"}
+    try:
+        with urlopen(Request(url, data=data, headers=headers, method=method), timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        # OAuth 2 access tokens expire after two hours.  Refresh once and retry
+        # the exact same API request; never retry a post more than once.
+        if error.code == 401 and bearer and not retried and cfg("X_OAUTH2_REFRESH_TOKEN"):
+            refresh_x_oauth2_token()
+            return x_request(method, url, payload, retried=True)
+        raise
+
+def x_verify_identity():
+    return x_request("GET", "https://api.x.com/2/users/me")["data"]
+
+def x_upload_image(path):
+    encoded = base64.b64encode(Path(path).read_bytes()).decode()
+    response = x_request("POST", "https://api.x.com/2/media/upload", {"media": encoded, "media_category": "tweet_image", "media_type": "image/png"})
+    return response["data"]["id"]
+
+def x_post_circuit_breaker(code, image_path):
+    media_id = x_upload_image(image_path)
+    response = x_request("POST", "https://api.x.com/2/tweets", {"text": f"#{code} Devre kesti. #borsa #bist", "media": {"media_ids": [media_id]}})
+    return response["data"]["id"]
+
 def deliver(store, ident, item, detail, dry_run):
     important = is_important(item, detail)
     store.save(ident, important, text_of(detail.get("subject")))
-    if not important or store.telegram_sent(ident): return 0
+    if not important: return 0
     message = draft(detail)
     card = None
     try:
@@ -214,9 +370,16 @@ def deliver(store, ident, item, detail, dry_run):
     except Exception as error:
         logging.warning("Devre kesici görseli üretilemedi (%s); sade metin gönderiliyor", error)
     if dry_run: logging.info("DRY RUN:\n%s", message)
-    elif (telegram_send_photo(card, message) if card else telegram_send(message)):
+    elif not store.telegram_sent(ident) and (telegram_send_photo(card, message) if card else telegram_send(message)):
         store.mark_telegram_sent(ident)
         logging.info("Telegram gönderildi: %s", ident)
+    if card and cfg("X_AUTO_POST_DKB", "false").lower() == "true" and not store.x_posted(ident) and not dry_run:
+        try:
+            post_id = x_post_circuit_breaker(stocks(detail)[0], card)
+            store.mark_x_posted(ident, post_id)
+            logging.info("X paylaşımı yapıldı: %s", ident)
+        except Exception:
+            logging.exception("X paylaşımı başarısız: %s", ident)
     if card: Path(card).unlink(missing_ok=True)
     return 1
 
@@ -262,7 +425,11 @@ def run_once(store, dry_run=False):
 
 def main():
     load_env(); logging.basicConfig(level=getattr(logging, cfg("LOG_LEVEL", "INFO").upper()), format="%(asctime)s %(levelname)s %(message)s")
-    parser=argparse.ArgumentParser(); parser.add_argument("--once", action="store_true"); parser.add_argument("--dry-run", action="store_true"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument("--once", action="store_true"); parser.add_argument("--dry-run", action="store_true"); parser.add_argument("--x-authorize", action="store_true"); parser.add_argument("--x-verify", action="store_true"); args=parser.parse_args()
+    if args.x_authorize:
+        profile = authorize_x_oauth2(); logging.info("X kullanıcı yetkilendirmesi tamamlandı: @%s", profile.get("username")); return
+    if args.x_verify:
+        profile = x_verify_identity(); logging.info("X bağlantısı doğrulandı: @%s", profile.get("username")); return
     store=Store(cfg("DATABASE_PATH", "data/kap_bot.sqlite3"))
     while True:
         try: run_public_once(store, args.dry_run) if cfg("KAP_SOURCE", "public").lower() == "public" else run_once(store, args.dry_run)

@@ -1,4 +1,5 @@
 import sys
+import os
 import unittest
 from pathlib import Path
 from PIL import Image
@@ -37,6 +38,40 @@ class KapBotTests(unittest.TestCase):
         with Image.open(path) as image:
             self.assertEqual(image.size, (1200, 675))
         Path(path).unlink()
+
+    def test_oauth_header_is_created(self):
+        original = {key: os.environ.get(key) for key in ("X_API_KEY", "X_API_KEY_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET")}
+        os.environ.update({"X_API_KEY": "key", "X_API_KEY_SECRET": "secret", "X_ACCESS_TOKEN": "token", "X_ACCESS_TOKEN_SECRET": "token-secret"})
+        header = kap_bot.x_oauth_header("GET", "https://api.x.com/2/users/me")
+        self.assertIn('oauth_consumer_key="key"', header)
+        self.assertIn("oauth_signature=", header)
+        for key, value in original.items():
+            if value is None: os.environ.pop(key, None)
+            else: os.environ[key] = value
+
+    def test_bearer_token_is_preferred_when_present(self):
+        original = os.environ.get("X_OAUTH2_ACCESS_TOKEN")
+        try:
+            os.environ["X_OAUTH2_ACCESS_TOKEN"] = "oauth2-token"
+            kap_bot._x_oauth2_access_token = None
+            self.assertEqual(kap_bot.x_bearer_token(), "oauth2-token")
+        finally:
+            kap_bot._x_oauth2_access_token = None
+            if original is None: os.environ.pop("X_OAUTH2_ACCESS_TOKEN", None)
+            else: os.environ["X_OAUTH2_ACCESS_TOKEN"] = original
+
+    def test_x_authorization_url_uses_user_scopes_and_pkce(self):
+        original = os.environ.get("X_OAUTH2_CLIENT_ID")
+        try:
+            os.environ["X_OAUTH2_CLIENT_ID"] = "client-id"
+            url = kap_bot.x_authorization_url("http://127.0.0.1:8787/callback", "state-value", "verifier-value")
+            self.assertIn("response_type=code", url)
+            self.assertIn("client_id=client-id", url)
+            self.assertIn("tweet.write", url)
+            self.assertIn("code_challenge_method=S256", url)
+        finally:
+            if original is None: os.environ.pop("X_OAUTH2_CLIENT_ID", None)
+            else: os.environ["X_OAUTH2_CLIENT_ID"] = original
 
 
 if __name__ == "__main__":
