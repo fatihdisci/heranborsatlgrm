@@ -78,6 +78,36 @@ class KapBotTests(unittest.TestCase):
         self.assertIn("%70'i şirkete", result)
         self.assertIn("%30'u arsa sahiplerine", result)
 
+    def test_store_tracks_telegram_link_separately(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            store = kap_bot.Store(Path(directory) / "test.sqlite3")
+            store.save(123, True, "Test")
+            self.assertFalse(store.telegram_link_sent(123))
+            store.mark_telegram_link_sent(123)
+            self.assertTrue(store.telegram_link_sent(123))
+
+    def test_non_circuit_delivery_sends_link_after_card(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            store = kap_bot.Store(Path(directory) / "test.sqlite3")
+            calls = []
+            original_photo, original_message = kap_bot.telegram_send_photo, kap_bot.telegram_send
+            original_card = kap_bot.render_event_card
+            try:
+                kap_bot.telegram_send_photo = lambda path, text: calls.append(("photo", text)) or True
+                kap_bot.telegram_send = lambda text: calls.append(("link", text)) or True
+                kap_bot.render_event_card = lambda event, label, detail: str(Path(directory) / "card.png")
+                Path(directory, "card.png").touch()
+                detail = {"subject": {"tr": "Yeni İş İlişkisi"}, "content": {"tr": "Şirket sözleşme imzaladı."}, "relatedStocks": [{"code": "BRLSM"}], "link": "https://www.kap.org.tr/tr/Bildirim/123"}
+                item = {"disclosureType": "PUBLIC"}
+                kap_bot.deliver(store, 123, item, detail, dry_run=False)
+            finally:
+                kap_bot.telegram_send_photo, kap_bot.telegram_send = original_photo, original_message
+                kap_bot.render_event_card = original_card
+            self.assertEqual([kind for kind, _ in calls], ["photo", "link"])
+            self.assertEqual(calls[1][1], detail["link"])
+
     def test_ai_tweet_finalizer_removes_link_and_keeps_tags(self):
         result = kap_bot.finalise_ai_tweet("Şirket sözleşme imzaladı. https://example.com", ["BRLSM"])
         self.assertEqual(result, "Şirket sözleşme imzaladı. #BRLSM #borsa #bist")

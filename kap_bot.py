@@ -94,6 +94,7 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS disclosures (id INTEGER PRIMARY KEY, important INTEGER NOT NULL, telegram_sent INTEGER NOT NULL DEFAULT 0, title TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(disclosures)")}
         if "x_post_id" not in columns: self.db.execute("ALTER TABLE disclosures ADD COLUMN x_post_id TEXT")
+        if "telegram_link_sent" not in columns: self.db.execute("ALTER TABLE disclosures ADD COLUMN telegram_link_sent INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
     def get_cursor(self, key="cursor"):
         row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone(); return int(row[0]) if row else None
@@ -106,6 +107,10 @@ class Store:
         row = self.db.execute("SELECT telegram_sent FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
     def mark_telegram_sent(self, ident):
         self.db.execute("UPDATE disclosures SET telegram_sent=1 WHERE id=?", (ident,)); self.db.commit()
+    def telegram_link_sent(self, ident):
+        row = self.db.execute("SELECT telegram_link_sent FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
+    def mark_telegram_link_sent(self, ident):
+        self.db.execute("UPDATE disclosures SET telegram_link_sent=1 WHERE id=?", (ident,)); self.db.commit()
     def x_posted(self, ident):
         row = self.db.execute("SELECT x_post_id FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
     def mark_x_posted(self, ident, post_id):
@@ -624,10 +629,22 @@ def deliver(store, ident, item, detail, dry_run):
         elif event: card = render_event_card(event[0], event[1], detail)
     except Exception as error:
         logging.warning("KAP görseli üretilemedi (%s); sade metin gönderiliyor", error)
-    if dry_run: logging.info("DRY RUN:\n%s", message)
-    elif not store.telegram_sent(ident) and (telegram_send_photo(card, message) if card else telegram_send(message)):
-        store.mark_telegram_sent(ident)
-        logging.info("Telegram gönderildi: %s", ident)
+    link = clean(detail.get("link", ""))
+    if dry_run:
+        logging.info("DRY RUN:\n%s%s", message, f"\n{link}" if (link and not is_circuit) else "")
+    else:
+        # Track the media/text and the link independently. If the second
+        # Telegram call fails, the next retry sends only the missing link.
+        primary_sent = store.telegram_sent(ident)
+        if not primary_sent:
+            primary_sent = telegram_send_photo(card, message) if card else telegram_send(message)
+            if primary_sent:
+                store.mark_telegram_sent(ident)
+                logging.info("Telegram gönderildi: %s", ident)
+        if primary_sent and not is_circuit and link and not store.telegram_link_sent(ident):
+            if telegram_send(link):
+                store.mark_telegram_link_sent(ident)
+                logging.info("Telegram KAP linki gönderildi: %s", ident)
     # Even if this explicit switch is enabled later, only circuit breakers may
     # be posted automatically. All other KAP cards remain Telegram-only.
     if is_circuit and card and cfg("X_AUTO_POST_DKB", "false").lower() == "true" and not store.x_posted(ident) and not dry_run:
