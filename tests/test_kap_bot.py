@@ -49,8 +49,12 @@ class KapBotTests(unittest.TestCase):
     def test_event_card_renders(self):
         detail = {"summary": {"tr": "Şirket yeni bir iş ilişkisi açıkladı."}, "relatedStocks": [{"code": "BRLSM"}]}
         path = kap_bot.render_event_card("business", "YENİ İŞ İLİŞKİSİ", detail)
-        with Image.open(path) as image: self.assertEqual(image.size, (1200, 675))
+        with Image.open(path) as image: self.assertEqual(image.size, (1080, 1920))
         Path(path).unlink()
+
+    def test_branded_backgrounds_are_available(self):
+        self.assertTrue((kap_bot.ASSETS / "dkb-background.jpg").exists())
+        self.assertTrue((kap_bot.ASSETS / "event-background.jpg").exists())
 
     def test_required_tags_removes_urls_and_keeps_ticker(self):
         text = kap_bot.required_tags(kap_bot.tweet_only("Kısa açıklama https://example.com"), ["AVGY0"])

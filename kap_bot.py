@@ -7,9 +7,10 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 ROOT = Path(__file__).resolve().parent
+ASSETS = ROOT / "assets"
 
 def load_env(path=ROOT / ".env"):
     if path.exists():
@@ -199,58 +200,73 @@ def card_font(size, bold=False):
         if Path(path).exists(): return ImageFont.truetype(path, size)
     return ImageFont.load_default()
 
+def card_background(filename, size):
+    """Fit one of the supplied branded background images to the card canvas."""
+    path = ASSETS / filename
+    if not path.exists(): return Image.new("RGB", size, "#FAFAF8")
+    with Image.open(path) as original:
+        return ImageOps.fit(original.convert("RGB"), size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+
+def translucent_panel(image, bounds, alpha=225):
+    overlay = Image.new("RGBA", image.size, (255, 255, 255, 0))
+    ImageDraw.Draw(overlay).rounded_rectangle(bounds, radius=30, fill=(255, 255, 255, alpha))
+    return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+
+def wrap_card_text(draw, text, font, max_width, max_lines):
+    words, lines, line = text.split(), [], ""
+    for word in words:
+        candidate = (line + " " + word).strip()
+        if draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
+            if line: lines.append(line)
+            line = word
+            if len(lines) == max_lines: break
+        else: line = candidate
+    if line and len(lines) < max_lines: lines.append(line)
+    return lines
+
 def render_circuit_card(code, market):
-    """Create a clean 1200×675 circuit-breaker chart card for Telegram/X."""
-    image = Image.new("RGB", (1200, 675), "#FAFAF8")
+    """Create a branded horizontal 1200×675 circuit-breaker card."""
+    image = translucent_panel(card_background("dkb-background.jpg", (1200, 675)), (55, 48, 1145, 610), 218)
     draw = ImageDraw.Draw(image)
     dark, muted, red = "#141414", "#747474", "#D65A4A"
-    draw.rounded_rectangle((55, 48, 1145, 625), radius=28, fill="#FFFFFF", outline="#E9E7E2", width=2)
-    draw.text((95, 86), "DEVRE KESİCİ", font=card_font(28, True), fill=red)
-    draw.text((95, 132), code, font=card_font(56, True), fill=dark)
-    draw.text((95, 203), str(market["name"])[:38], font=card_font(25), fill=muted)
+    draw.text((90, 82), "DEVRE KESİCİ", font=card_font(30, True), fill=red)
+    draw.text((90, 126), f"#{code}", font=card_font(64, True), fill=dark)
+    draw.text((92, 205), str(market["name"])[:38], font=card_font(27), fill=muted)
     price = (f"{market['price']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")) + " TL"
-    draw.text((95, 248), price, font=card_font(52, True), fill=dark)
+    draw.text((90, 250), price, font=card_font(54, True), fill=dark)
     change = f"%{market['change_pct']:+.2f}".replace(".", ",")
-    draw.text((360, 268), change, font=card_font(28, True), fill=red if market["change_pct"] < 0 else "#27805C")
+    draw.text((375, 270), change, font=card_font(30, True), fill=red if market["change_pct"] < 0 else "#27805C")
     points = market["points"]
     low, high = min(points), max(points)
-    left, top, right, bottom = 95, 345, 1105, 530
+    left, top, right, bottom = 90, 350, 1110, 535
     if high == low: high += 1
     coords = [(left + i * (right-left)/(len(points)-1), bottom - (point-low)/(high-low)*(bottom-top)) for i, point in enumerate(points)] if len(points) > 1 else []
     if coords: draw.line(coords, fill=red, width=6, joint="curve")
     draw.line((left, bottom, right, bottom), fill="#ECEAE6", width=2)
-    draw.text((95, 563), "İşlemler tek fiyat yöntemiyle devam ediyor.", font=card_font(21), fill=muted)
-    footer = "@heranborsa"
-    footer_width = draw.textbbox((0, 0), footer, font=card_font(22, True))[2]
-    draw.text((1105-footer_width, 563), footer, font=card_font(22, True), fill=dark)
+    draw.text((90, 560), "İşlemler tek fiyat yöntemiyle devam ediyor.", font=card_font(23), fill=muted)
     handle = tempfile.NamedTemporaryFile(prefix=f"kap-{code}-", suffix=".png", delete=False)
     handle.close(); image.save(handle.name, "PNG", optimize=True)
     return handle.name
 
 def render_event_card(event, label, detail):
-    """Render a shareable KAP event card for the selected high-signal events."""
+    """Render a branded vertical 1080×1920 card for high-signal KAP events."""
     codes = stocks(detail)
-    image = Image.new("RGB", (1200, 675), "#FAFAF8")
+    image = translucent_panel(card_background("event-background.jpg", (1080, 1920)), (54, 70, 1026, 1580), 220)
     draw = ImageDraw.Draw(image)
     accent = {"buyback": "#3B82C4", "business": "#27805C", "share_trade": "#9C6BDB", "suspension": "#D65A4A"}[event]
-    draw.rounded_rectangle((55, 48, 1145, 625), radius=28, fill="#FFFFFF", outline="#E9E7E2", width=2)
-    draw.rounded_rectangle((95, 84, 95 + max(185, len(label) * 18), 126), radius=12, fill=accent)
-    draw.text((112, 92), label, font=card_font(19, True), fill="#FFFFFF")
-    draw.text((95, 160), "  ".join(f"#{code}" for code in codes), font=card_font(48, True), fill="#141414")
-    summary = summary_line(detail, 260)
-    words, lines, line = summary.split(), [], ""
-    for word in words:
-        candidate = (line + " " + word).strip()
-        if draw.textbbox((0, 0), candidate, font=card_font(31))[2] > 960:
-            lines.append(line); line = word
-        else: line = candidate
-    if line: lines.append(line)
-    for index, line in enumerate(lines[:4]): draw.text((95, 252 + index * 48), line, font=card_font(31), fill="#333333")
-    draw.line((95, 540, 1105, 540), fill="#ECEAE6", width=2)
-    draw.text((95, 566), "KAP bildirimi", font=card_font(21), fill="#747474")
-    footer = "@heranborsa"; footer_font = card_font(22, True)
-    footer_width = draw.textbbox((0, 0), footer, font=footer_font)[2]
-    draw.text((1105-footer_width, 563), footer, font=footer_font, fill="#141414")
+    badge_width = max(305, draw.textbbox((0, 0), label, font=card_font(30, True))[2] + 72)
+    draw.rounded_rectangle((105, 145, 105 + badge_width, 210), radius=16, fill=accent)
+    draw.text((138, 160), label, font=card_font(30, True), fill="#FFFFFF")
+    code_font = card_font(76, True)
+    code_lines = wrap_card_text(draw, "  ".join(f"#{code}" for code in codes), code_font, 840, 2)
+    for index, line in enumerate(code_lines): draw.text((105, 280 + index * 90), line, font=code_font, fill="#141414")
+    summary_font = card_font(48)
+    summary = summary_line(detail, 390)
+    lines = wrap_card_text(draw, summary, summary_font, 840, 7)
+    summary_y = 505 if len(code_lines) == 1 else 590
+    for index, line in enumerate(lines): draw.text((105, summary_y + index * 67), line, font=summary_font, fill="#292929")
+    draw.line((105, 1480, 975, 1480), fill="#D9D7D2", width=2)
+    draw.text((105, 1518), "KAP BİLDİRİMİ", font=card_font(28, True), fill="#747474")
     handle = tempfile.NamedTemporaryFile(prefix=f"kap-{event}-", suffix=".png", delete=False)
     handle.close(); image.save(handle.name, "PNG", optimize=True)
     return handle.name
