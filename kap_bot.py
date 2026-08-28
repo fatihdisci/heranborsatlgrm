@@ -68,16 +68,16 @@ class PublicKapClient:
         company = re.search(r'Related Companies.*?<div class="gwt-Label">\[([A-Z][A-Z0-9]{1,5}(?:\s*,\s*[A-Z][A-Z0-9]{1,5})*)\]</div>', source, re.S)
         # Many company disclosures leave "Related Companies" empty. Their
         # own BIST code is used as the safe fallback.
-        explanation = re.search(r'text-block-value[^>]*>.*?<p[^>]*>(.*?)</p>', source, re.S)
+        content = extract_disclosure_content(source)
         sent_at = re.search(r'(\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2})', source)
-        if not summary and not explanation: return None
-        summary_text = clean(summary.group(1) if summary else explanation.group(1))
+        if not summary and not content: return None
+        summary_text = clean(summary.group(1) if summary else content)
         is_circuit = "Devre Kesici" in source or "Circuit Break" in source
         item = {"disclosureIndex": str(index), "disclosureType": "DKB" if is_circuit else "PUBLIC"}
         detail = {
             "subject": {"tr": "Pay Bazında Devre Kesici Bildirimi" if is_circuit else summary_text},
             "summary": {"tr": summary_text},
-            "content": {"tr": clean(explanation.group(1)) if explanation else ""},
+            "content": {"tr": content},
             "relatedStocks": [{"code": code.strip()} for code in company.group(1).split(",")] if company else ([{"code": own_stock.group(1)}] if own_stock else []),
             "time": sent_at.group(1) if sent_at else "",
             "link": self.base + str(index),
@@ -121,6 +121,22 @@ SPECIAL_EVENTS = (
 )
 def clean(value):
     text = re.sub(r"<[^>]+>", " ", html.unescape(value or "")); return re.sub(r"\s+", " ", text).strip()
+
+def extract_disclosure_content(source):
+    """Return every paragraph from KAP's disclosure body, not only the first."""
+    # The source is the notification DOM, whose rich-text body ends right
+    # before the adjacent taxonomy cell.  This boundary avoids page chrome or
+    # embedded scripts being treated as disclosure text.
+    block = re.search(
+        r'text-block-value[^>]*>(.*?)(?=</td>\s*<td[^>]*class="taxonomy-context-value-summernote)',
+        source,
+        re.S,
+    )
+    if block: return clean(block.group(1))
+    # Some older KAP layouts have no taxonomy cell; retain a conservative
+    # first-paragraph fallback for them.
+    paragraph = re.search(r'text-block-value[^>]*>.*?<p[^>]*>(.*?)</p>', source, re.S)
+    return clean(paragraph.group(1)) if paragraph else ""
 def text_of(obj, lang="tr"):
     return obj.get(lang) if isinstance(obj, dict) else (obj or "")
 def stocks(detail):

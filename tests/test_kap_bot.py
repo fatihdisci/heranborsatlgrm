@@ -58,6 +58,11 @@ class KapBotTests(unittest.TestCase):
         result = kap_bot.finalise_ai_tweet("Şirket sözleşme imzaladı. https://example.com", ["BRLSM"])
         self.assertEqual(result, "Şirket sözleşme imzaladı. #BRLSM #borsa #bist")
 
+    def test_disclosure_content_includes_all_body_paragraphs(self):
+        source = ('text-block-value"><p>İlk ayrıntı.</p><p>İkinci ayrıntı.</p>'
+                  '</div></div></div></td><td class="taxonomy-context-value-summernote">')
+        self.assertEqual(kap_bot.extract_disclosure_content(source), "İlk ayrıntı. İkinci ayrıntı.")
+
     def test_event_card_renders(self):
         detail = {"summary": {"tr": "Şirket yeni bir iş ilişkisi açıkladı."}, "senderTitle": "BİRLEŞİM MÜHENDİSLİK ISITMA SOĞUTMA HAVALANDIRMA SANAYİ VE TİCARET A.Ş.", "relatedStocks": [{"code": "BRLSM"}]}
         path = kap_bot.render_event_card("business", "YENİ İŞ İLİŞKİSİ", detail)
