@@ -257,16 +257,9 @@ def update_env_secret(key, value):
 
 def refresh_x_oauth2_token():
     """Refresh OAuth 2 credentials and retain the rotating refresh token."""
-    refresh_token, client_id = cfg("X_OAUTH2_REFRESH_TOKEN"), cfg("X_OAUTH2_CLIENT_ID")
-    if not refresh_token or not client_id: raise ValueError("X OAuth 2 yenileme ayarları eksik")
-    body = {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": client_id}
-    headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "heranborsa-kap-bot/1.0"}
-    client_secret = cfg("X_OAUTH2_CLIENT_SECRET")
-    if client_secret:
-        basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-        headers["Authorization"] = f"Basic {basic}"
-    request = Request("https://api.x.com/2/oauth2/token", data=urlencode(body).encode(), headers=headers, method="POST")
-    with urlopen(request, timeout=30) as response: result = json.loads(response.read().decode("utf-8"))
+    refresh_token = cfg("X_OAUTH2_REFRESH_TOKEN")
+    if not refresh_token: raise ValueError("X OAuth 2 yenileme ayarları eksik")
+    result = x_oauth2_token_request({"grant_type": "refresh_token", "refresh_token": refresh_token})
     global _x_oauth2_access_token
     _x_oauth2_access_token = result["access_token"]
     update_env_secret("X_OAUTH2_ACCESS_TOKEN", result["access_token"])
@@ -277,12 +270,16 @@ def refresh_x_oauth2_token():
 def x_oauth2_token_request(payload):
     """Exchange or refresh user-context OAuth 2 credentials."""
     client_id = cfg("X_OAUTH2_CLIENT_ID")
+    if not client_id: raise ValueError("X_OAUTH2_CLIENT_ID eksik")
+    body = dict(payload)
     headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "heranborsa-kap-bot/1.0"}
     client_secret = cfg("X_OAUTH2_CLIENT_SECRET")
     if client_secret:
         basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         headers["Authorization"] = f"Basic {basic}"
-    request = Request("https://api.x.com/2/oauth2/token", data=urlencode(payload).encode(), headers=headers, method="POST")
+    else:
+        body.setdefault("client_id", client_id)
+    request = Request("https://api.x.com/2/oauth2/token", data=urlencode(body).encode(), headers=headers, method="POST")
     with urlopen(request, timeout=30) as response: return json.loads(response.read().decode("utf-8"))
 
 def x_authorization_url(redirect_uri, state, verifier):
@@ -294,7 +291,7 @@ def x_authorization_url(redirect_uri, state, verifier):
         "scope": "tweet.read tweet.write users.read offline.access media.write",
         "state": state, "code_challenge": challenge, "code_challenge_method": "S256",
     }
-    return "https://twitter.com/i/oauth2/authorize?" + urlencode(params)
+    return "https://x.com/i/oauth2/authorize?" + urlencode(params)
 
 def authorize_x_oauth2():
     """Run once locally to obtain an OAuth 2 *user-context* token for X."""
@@ -323,7 +320,7 @@ def authorize_x_oauth2():
         raise ValueError("X kullanıcı yetkilendirmesi tamamlanamadı")
     result = x_oauth2_token_request({
         "grant_type": "authorization_code", "code": received["code"],
-        "redirect_uri": redirect_uri, "client_id": cfg("X_OAUTH2_CLIENT_ID"), "code_verifier": verifier,
+        "redirect_uri": redirect_uri, "code_verifier": verifier,
     })
     global _x_oauth2_access_token
     _x_oauth2_access_token = result["access_token"]
