@@ -31,6 +31,27 @@ class KapBotTests(unittest.TestCase):
     def test_circuit_tweet_is_short_and_ready_to_post(self):
         self.assertEqual(kap_bot.circuit_tweet("HEDEF"), "#HEDEF Devre kesti. #borsa #bist")
 
+    def test_special_kap_events_are_selected_for_cards(self):
+        cases = {
+            "buyback": "Payların Geri Alınmasına İlişkin Bildirim",
+            "business": "Yeni İş İlişkisi",
+            "share_trade": "Pay Alım Satım Bildirimi",
+            "suspension": "Faaliyetlerin Kısmen veya Tamamen Durdurulması ya da İmkansız Hale Gelmesi",
+        }
+        for expected, title in cases.items():
+            detail = {"subject": {"tr": title}, "summary": {"tr": "Önemli KAP açıklaması"}, "relatedStocks": [{"code": "TEST"}]}
+            self.assertEqual(kap_bot.special_event(detail)[0], expected)
+
+    def test_event_tweet_keeps_ticker_and_market_tags(self):
+        detail = {"subject": {"tr": "Yeni İş İlişkisi"}, "summary": {"tr": "Şirket sözleşme imzaladı."}, "relatedStocks": [{"code": "BRLSM"}]}
+        self.assertEqual(kap_bot.event_tweet("business", detail), "Yeni iş ilişkisi: Şirket sözleşme imzaladı. #BRLSM #borsa #bist")
+
+    def test_event_card_renders(self):
+        detail = {"summary": {"tr": "Şirket yeni bir iş ilişkisi açıkladı."}, "relatedStocks": [{"code": "BRLSM"}]}
+        path = kap_bot.render_event_card("business", "YENİ İŞ İLİŞKİSİ", detail)
+        with Image.open(path) as image: self.assertEqual(image.size, (1200, 675))
+        Path(path).unlink()
+
     def test_required_tags_removes_urls_and_keeps_ticker(self):
         text = kap_bot.required_tags(kap_bot.tweet_only("Kısa açıklama https://example.com"), ["AVGY0"])
         self.assertEqual(text, "Kısa açıklama #AVGY0 #borsa #bist")

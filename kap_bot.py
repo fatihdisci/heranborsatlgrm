@@ -103,8 +103,15 @@ class Store:
     def mark_x_posted(self, ident, post_id):
         self.db.execute("UPDATE disclosures SET x_post_id=? WHERE id=?", (str(post_id), ident)); self.db.commit()
 
-KEYWORDS = re.compile(r"temettü|bedelli|bedelsiz|sermaye artır|geri alım|ihale sonucu|sözleşme imzalan|iş ilişkisi|yatırım projesi|kapasite artış|birleşme|satın alma|finansal sonuç|net kâr|net zarar|iflas|konkordato|geri alım programı|pay alım satım|özel durum|devre kesici|sürekli işleme ara|tek fiyat emir toplama", re.I)
+KEYWORDS = re.compile(r"temettü|bedelli|bedelsiz|sermaye artır|geri alım|ihale sonucu|sözleşme imzalan|iş ilişkisi|yatırım projesi|kapasite artış|birleşme|satın alma|finansal sonuç|net kâr|net zarar|iflas|konkordato|geri alım programı|pay alım satım|özel durum|devre kesici|sürekli işleme ara|tek fiyat emir toplama|faaliyet.*durdur|imkansız hale", re.I)
 NOISE = re.compile(r"borsa dışı repo|yatırımcı bilgi formu|yönetim kurulu komiteleri|varant|itfa fiyat|summernote|project|issues", re.I)
+SPECIAL_EVENTS = (
+    ("circuit", "DEVRE KESİCİ", re.compile(r"devre kesici|sürekli işleme ara|tek fiyat emir toplama", re.I)),
+    ("buyback", "PAY GERİ ALIMI", re.compile(r"payların geri alınması|pay geri alım|geri alınan pay", re.I)),
+    ("business", "YENİ İŞ İLİŞKİSİ", re.compile(r"yeni iş ilişkisi|sözleşme imzalanması|ihale sonucu", re.I)),
+    ("share_trade", "PAY ALIM SATIMI", re.compile(r"pay alım satım bildirimi|pay satış bildirimi|sermaye piyasası aracı alım satım", re.I)),
+    ("suspension", "FAALİYET DURDURMA", re.compile(r"faaliyetlerin kısmen veya tamamen durdurulması|faaliyet.*durdurul|imkansız hale", re.I)),
+)
 def clean(value):
     text = re.sub(r"<[^>]+>", " ", html.unescape(value or "")); return re.sub(r"\s+", " ", text).strip()
 def text_of(obj, lang="tr"):
@@ -113,6 +120,17 @@ def stocks(detail):
     # BIST symbols may contain digits (for example AVGY0), but a number alone
     # is never a valid symbol and must not become a hashtag such as #18.
     return [x.get("code") for x in detail.get("relatedStocks", []) if re.fullmatch(r"[A-Z][A-Z0-9]{1,5}", x.get("code", ""))]
+def disclosure_text(detail):
+    return " ".join(clean(text_of(detail.get(part))) for part in ("subject", "summary", "content"))
+def special_event(detail):
+    joined = disclosure_text(detail)
+    for ident, label, pattern in SPECIAL_EVENTS:
+        if pattern.search(joined): return ident, label
+    return None
+def summary_line(detail, limit=165):
+    text = clean(text_of(detail.get("summary")) or text_of(detail.get("content")) or text_of(detail.get("subject")))
+    if len(text) <= limit: return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip(".,;:") + "…"
 def tweet_only(text):
     """Keep the Telegram payload ready to paste into X, with no meta labels."""
     text = re.sub(r"https?://\S+", "", text, flags=re.I)
@@ -134,7 +152,7 @@ def is_important(item, detail):
     # Every published message must identify a real listed company.  This
     # prevents fund notices, forms and page noise from becoming stock alerts.
     if not stocks(detail) or NOISE.search(joined): return False
-    return item.get("disclosureType") == "DKB" or bool(KEYWORDS.search(joined))
+    return bool(special_event(detail)) or item.get("disclosureType") == "DKB" or bool(KEYWORDS.search(joined))
 
 def draft(detail):
     """A compact, verbatim notification card; no AI-generated wording."""
@@ -145,6 +163,13 @@ def draft(detail):
 def circuit_tweet(code):
     """The ready-to-post text paired with every circuit-breaker card."""
     return f"#{code} Devre kesti. #borsa #bist"
+
+def event_tweet(event, detail):
+    codes = stocks(detail)
+    if event == "circuit": return circuit_tweet(codes[0])
+    titles = {"buyback": "Pay geri alımı", "business": "Yeni iş ilişkisi", "share_trade": "Pay alım satım bildirimi", "suspension": "Faaliyet durdurma kararı"}
+    body = f"{titles[event]}: {summary_line(detail, 180)}"
+    return required_tags(tweet_only(body), codes)
 
 def telegram_send(text):
     token, chat = cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")
@@ -199,6 +224,34 @@ def render_circuit_card(code, market):
     footer_width = draw.textbbox((0, 0), footer, font=card_font(22, True))[2]
     draw.text((1105-footer_width, 563), footer, font=card_font(22, True), fill=dark)
     handle = tempfile.NamedTemporaryFile(prefix=f"kap-{code}-", suffix=".png", delete=False)
+    handle.close(); image.save(handle.name, "PNG", optimize=True)
+    return handle.name
+
+def render_event_card(event, label, detail):
+    """Render a shareable KAP event card for the selected high-signal events."""
+    codes = stocks(detail)
+    image = Image.new("RGB", (1200, 675), "#FAFAF8")
+    draw = ImageDraw.Draw(image)
+    accent = {"buyback": "#3B82C4", "business": "#27805C", "share_trade": "#9C6BDB", "suspension": "#D65A4A"}[event]
+    draw.rounded_rectangle((55, 48, 1145, 625), radius=28, fill="#FFFFFF", outline="#E9E7E2", width=2)
+    draw.rounded_rectangle((95, 84, 95 + max(185, len(label) * 18), 126), radius=12, fill=accent)
+    draw.text((112, 92), label, font=card_font(19, True), fill="#FFFFFF")
+    draw.text((95, 160), "  ".join(f"#{code}" for code in codes), font=card_font(48, True), fill="#141414")
+    summary = summary_line(detail, 260)
+    words, lines, line = summary.split(), [], ""
+    for word in words:
+        candidate = (line + " " + word).strip()
+        if draw.textbbox((0, 0), candidate, font=card_font(31))[2] > 960:
+            lines.append(line); line = word
+        else: line = candidate
+    if line: lines.append(line)
+    for index, line in enumerate(lines[:4]): draw.text((95, 252 + index * 48), line, font=card_font(31), fill="#333333")
+    draw.line((95, 540, 1105, 540), fill="#ECEAE6", width=2)
+    draw.text((95, 566), "KAP bildirimi", font=card_font(21), fill="#747474")
+    footer = "@heranborsa"; footer_font = card_font(22, True)
+    footer_width = draw.textbbox((0, 0), footer, font=footer_font)[2]
+    draw.text((1105-footer_width, 563), footer, font=footer_font, fill="#141414")
+    handle = tempfile.NamedTemporaryFile(prefix=f"kap-{event}-", suffix=".png", delete=False)
     handle.close(); image.save(handle.name, "PNG", optimize=True)
     return handle.name
 
@@ -364,11 +417,13 @@ def deliver(store, ident, item, detail, dry_run):
     important = is_important(item, detail)
     store.save(ident, important, text_of(detail.get("subject")))
     if not important: return 0
-    is_circuit = item.get("disclosureType") == "DKB"
-    message = circuit_tweet(stocks(detail)[0]) if is_circuit else draft(detail)
+    event = special_event(detail)
+    is_circuit = event is not None and event[0] == "circuit"
+    message = event_tweet(event[0], detail) if event else draft(detail)
     card = None
     try:
         if is_circuit: card = render_circuit_card(stocks(detail)[0], yahoo_chart(stocks(detail)[0]))
+        elif event: card = render_event_card(event[0], event[1], detail)
     except Exception as error:
         logging.warning("Devre kesici görseli üretilemedi (%s); sade metin gönderiliyor", error)
     if dry_run: logging.info("DRY RUN:\n%s", message)
