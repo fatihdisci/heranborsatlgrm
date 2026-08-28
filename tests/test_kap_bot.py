@@ -35,6 +35,9 @@ class KapBotTests(unittest.TestCase):
     def test_circuit_tweet_is_short_and_ready_to_post(self):
         self.assertEqual(kap_bot.circuit_tweet("HEDEF"), "#HEDEF Devre kesti. #borsa #bist")
 
+    def test_circuit_card_discloses_delayed_yahoo_price_data(self):
+        self.assertEqual(kap_bot.CIRCUIT_DATA_NOTE, "Not: KAP haberi anlık; fiyat ve % değişim Yahoo Finance kaynaklı, yaklaşık 15 dk gecikmeli.")
+
     def test_special_kap_events_are_selected_for_cards(self):
         cases = {
             "buyback": "Payların Geri Alınmasına İlişkin Bildirim",

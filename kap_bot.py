@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
+CIRCUIT_DATA_NOTE = "Not: KAP haberi anlık; fiyat ve % değişim Yahoo Finance kaynaklı, yaklaşık 15 dk gecikmeli."
 
 def load_env(path=ROOT / ".env"):
     if path.exists():
@@ -389,7 +390,8 @@ def render_circuit_card(code, market):
     coords = [(left + i * (right-left)/(len(points)-1), bottom - (point-low)/(high-low)*(bottom-top)) for i, point in enumerate(points)] if len(points) > 1 else []
     if coords: draw.line(coords, fill=red, width=6, joint="curve")
     draw.line((left, bottom, right, bottom), fill="#ECEAE6", width=2)
-    draw.text((90, 560), "İşlemler tek fiyat yöntemiyle devam ediyor.", font=card_font(23), fill=muted)
+    draw.text((90, 552), "İşlemler tek fiyat yöntemiyle devam ediyor.", font=card_font(21), fill=muted)
+    draw.text((90, 582), CIRCUIT_DATA_NOTE, font=card_font(16), fill=muted)
     handle = tempfile.NamedTemporaryFile(prefix=f"kap-{code}-", suffix=".png", delete=False)
     handle.close(); image.save(handle.name, "PNG", optimize=True)
     return handle.name
