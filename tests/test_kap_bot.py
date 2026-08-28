@@ -51,8 +51,19 @@ class KapBotTests(unittest.TestCase):
         self.assertEqual(kap_bot.special_event(detail), ("business", "YENİ İŞ İLİŞKİSİ"))
 
     def test_event_tweet_keeps_ticker_and_market_tags(self):
-        detail = {"subject": {"tr": "Yeni İş İlişkisi"}, "summary": {"tr": "Şirket sözleşme imzaladı."}, "relatedStocks": [{"code": "BRLSM"}]}
-        self.assertEqual(kap_bot.event_tweet("business", detail), "Yeni iş ilişkisi: Şirket sözleşme imzaladı. #BRLSM #borsa #bist")
+        detail = {"subject": {"tr": "Yeni İş İlişkisi"}, "content": {"tr": "Şirket sözleşme imzaladı."}, "relatedStocks": [{"code": "BRLSM"}]}
+        self.assertEqual(kap_bot.event_tweet("business", detail), "Şirket sözleşme imzaladı. #BRLSM #borsa #bist")
+
+    def test_event_summary_prefers_current_contract_over_history(self):
+        detail = {"content": {"tr": "Önceki KAP açıklamasında duyurulduğu üzere ruhsat devir sözleşmesi imzalanmış ve tamamlanmıştı. Şirket, 5+5 toplam 10 kuyu için sondaj kulesi hizmet sözleşmesi imzaladı."}}
+        self.assertEqual(kap_bot.event_summary(detail, "business"), "Şirket, 5+5 toplam 10 kuyu için sondaj kulesi hizmet sözleşmesi imzaladı.")
+
+    def test_focused_summary_keeps_the_event_at_end_of_a_long_sentence(self):
+        sentence = "Ruhsat sahalarında yürütülen çok kapsamlı hazırlık çalışmaları ve teknik planlamalar kapsamında Türkiye'de yerleşik bir şirket ile 5+5 toplam 10 kuyu için sondaj kulesi hizmet sözleşmesi imzalanmıştır."
+        match = __import__("re").search(r"sözleşme\w*.*imzalan", sentence, __import__("re").I)
+        result = kap_bot.focused_summary(sentence, match, 110)
+        self.assertIn("10 kuyu", result)
+        self.assertIn("sözleşmesi imzalanmıştır", result)
 
     def test_ai_tweet_finalizer_removes_link_and_keeps_tags(self):
         result = kap_bot.finalise_ai_tweet("Şirket sözleşme imzaladı. https://example.com", ["BRLSM"])

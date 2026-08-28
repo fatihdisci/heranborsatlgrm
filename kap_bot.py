@@ -154,6 +154,44 @@ def summary_line(detail, limit=165):
     text = clean(text_of(detail.get("summary")) or text_of(detail.get("content")) or text_of(detail.get("subject")))
     if len(text) <= limit: return text
     return text[:limit].rsplit(" ", 1)[0].rstrip(".,;:") + "…"
+
+def event_summary(detail, event=None, limit=240):
+    """Select the disclosure sentence that states the event, not its title."""
+    content = clean(text_of(detail.get("content")))
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", content) if part.strip()]
+    background = re.compile(r"daha önce|duyurulduğu üzere|tamamlanmıştı|önceki kap|açıklamasında", re.I)
+    patterns = {
+        "business": r"sözleşme\w*.*imzalan|imzalan\w*.*sözleşme|ihale\w*.*(kazan|sonuç)",
+        "buyback": r"geri al\w*",
+        "share_trade": r"pay.*(al\w*|sat\w*)|(al\w*|sat\w*).*pay",
+        "suspension": r"faaliyet.*(durdur|sona er)|durdur\w*.*faaliyet",
+    }
+    pattern = patterns.get(event)
+    if pattern:
+        for sentence in sentences:
+            match = re.search(pattern, sentence, re.I)
+            if match and not background.search(sentence):
+                return focused_summary(sentence, match, limit)
+    # Avoid a standard "previously announced" lead-in if a later factual
+    # sentence exists.  This is common in detailed KAP explanations.
+    for sentence in sentences:
+        if not background.search(sentence) and not re.search(r"kamuoyuna", sentence, re.I):
+            return summary_line({"summary": {"tr": sentence}}, limit)
+    if content: return summary_line({"summary": {"tr": content}}, limit)
+    return summary_line(detail, limit)
+
+def focused_summary(sentence, match, limit):
+    """Shorten a long sentence around the actual event instead of its preamble."""
+    if len(sentence) <= limit: return sentence
+    start = max(0, match.start() - int(limit * 0.65))
+    end = min(len(sentence), match.end() + int(limit * 0.35))
+    fragment = sentence[start:end].strip()
+    if start:
+        first_space = fragment.find(" ")
+        fragment = fragment[first_space + 1:] if first_space >= 0 else fragment
+    if end < len(sentence):
+        fragment = fragment.rsplit(" ", 1)[0].rstrip(".,;:") + "…"
+    return fragment
 def tweet_only(text):
     """Keep the Telegram payload ready to paste into X, with no meta labels."""
     text = re.sub(r"https?://\S+", "", text, flags=re.I)
@@ -190,9 +228,11 @@ def circuit_tweet(code):
 def event_tweet(event, detail):
     codes = stocks(detail)
     if event == "circuit": return circuit_tweet(codes[0])
-    titles = {"buyback": "Pay geri alımı", "business": "Yeni iş ilişkisi", "share_trade": "Pay alım satım bildirimi", "suspension": "Faaliyet durdurma kararı"}
-    body = f"{titles[event]}: {summary_line(detail, 180)}"
-    return required_tags(tweet_only(body), codes)
+    return required_tags(tweet_only(event_summary(detail, event, 220)), codes)
+
+def factual_tweet(detail, event=None):
+    """Safe non-AI fallback: a real sentence from the disclosure body."""
+    return required_tags(tweet_only(event_summary(detail, event, 220)), stocks(detail))
 
 AI_TWEET_PROMPT = """Sen Her An Borsa için Türkçe KAP editörüsün.
 Verilen KAP verisini doğal, kısa ve haber diliyle tek bir tweet metnine dönüştür.
@@ -369,7 +409,7 @@ def render_event_card(event, label, detail):
     draw.text((56, y), display_company(detail)[:42], font=card_font(23), fill=muted)
     y += 64
     summary_font = card_font(30)
-    lines = wrap_card_text(draw, summary_line(detail, 330), summary_font, 610, 7)
+    lines = wrap_card_text(draw, event_summary(detail, event, 330), summary_font, 610, 7)
     for index, line in enumerate(lines): draw.text((56, y + index * 37), line, font=summary_font, fill="#202020")
     y += len(lines) * 37 + 40
     project, amount = card_project(detail), card_amount(detail)
@@ -551,7 +591,7 @@ def deliver(store, ident, item, detail, dry_run):
     if not important: return 0
     event = special_event(detail)
     is_circuit = event is not None and event[0] == "circuit"
-    fallback = event_tweet(event[0], detail) if event else draft(detail)
+    fallback = event_tweet(event[0], detail) if event else factual_tweet(detail)
     message = fallback if is_circuit else (ai_tweet(detail, event[0] if event else None) or fallback)
     card = None
     try:
