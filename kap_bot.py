@@ -100,6 +100,10 @@ class Store:
         row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone(); return int(row[0]) if row else None
     def set_cursor(self, value, key="cursor"):
         self.db.execute("INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value))); self.db.commit()
+    def state_value(self, key):
+        row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone(); return row[0] if row else None
+    def set_state(self, key, value):
+        self.db.execute("INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value))); self.db.commit()
     def seen(self, ident): return self.db.execute("SELECT 1 FROM disclosures WHERE id=?", (ident,)).fetchone() is not None
     def save(self, ident, important, title):
         self.db.execute("INSERT OR IGNORE INTO disclosures(id,important,title) VALUES(?,?,?)", (ident, int(important), title)); self.db.commit()
@@ -115,6 +119,7 @@ class Store:
         row = self.db.execute("SELECT x_post_id FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
     def mark_x_posted(self, ident, post_id):
         self.db.execute("UPDATE disclosures SET x_post_id=? WHERE id=?", (str(post_id), ident)); self.db.commit()
+    def close(self): self.db.close()
 
 KEYWORDS = re.compile(r"temettü|bedelli|bedelsiz|sermaye artır|geri alım|ihale sonucu|sözleşme\w*\s+imzalan|iş ilişkisi|yatırım projesi|kapasite artış|birleşme|satın alma|finansal sonuç|net kâr|net zarar|iflas|konkordato|geri alım programı|pay alım satım|özel durum|devre kesici|sürekli işleme ara|tek fiyat emir toplama|faaliyet.*durdur|imkansız hale", re.I)
 NOISE = re.compile(r"borsa dışı repo|yatırımcı bilgi formu|yönetim kurulu komiteleri|varant|itfa fiyat|summernote|project|issues", re.I)
@@ -230,6 +235,11 @@ def draft(detail):
 def circuit_tweet(code):
     """The ready-to-post text paired with every circuit-breaker card."""
     return f"#{code} Devre kesti. #borsa #bist"
+
+def circuit_batch_tweet(codes):
+    """One ready-to-post tweet for all circuit breakers found in a poll."""
+    unique = list(dict.fromkeys(code for code in codes if code))
+    return required_tags(f"{' '.join(f'#{code}' for code in unique)} Devre kesti.", unique)
 
 def event_tweet(event, detail):
     codes = stocks(detail)
@@ -626,6 +636,57 @@ def x_post_circuit_breaker(code, image_path):
     response = x_request("POST", "https://api.x.com/2/tweets", {"text": f"#{code} Devre kesti. #borsa #bist", "media": {"media_ids": [media_id]}})
     return response["data"]["id"]
 
+def build_circuit_card(code):
+    """Always make a DKB card, even when Yahoo has no quote yet."""
+    try:
+        market = yahoo_chart(code)
+    except Exception as error:
+        logging.warning("Yahoo fiyatı hazır değil (%s); veri bekleniyor kartı gönderiliyor", type(error).__name__)
+        market = {"name": code, "price": None, "change_pct": None, "points": []}
+    return render_circuit_card(code, market)
+
+def deliver_circuit_batch(store, disclosures, dry_run=False):
+    """Send every DKB card, then one combined ready-to-post tweet caption."""
+    delivered, codes, identifiers = 0, [], []
+    for ident, item, detail in disclosures:
+        important = is_important(item, detail)
+        store.save(ident, important, text_of(detail.get("subject")))
+        if not important: continue
+        code_list = stocks(detail)
+        if not code_list: continue
+        code = code_list[0]
+        identifiers.append(ident)
+        codes.append(code)
+        if dry_run:
+            logging.info("DRY RUN DKB kartı: %s", code)
+            delivered += 1
+            continue
+        if store.telegram_sent(ident):
+            delivered += 1
+            continue
+        card = None
+        try:
+            card = build_circuit_card(code)
+            # DKB cards are media-only; the shared caption is sent after the
+            # whole batch so the user gets one copy-ready tweet text.
+            if telegram_send_photo(card, ""):
+                store.mark_telegram_sent(ident)
+                delivered += 1
+                logging.info("Telegram DKB görseli gönderildi: %s", ident)
+        except Exception:
+            logging.exception("DKB görseli gönderilemedi: %s", ident)
+        finally:
+            if card: Path(card).unlink(missing_ok=True)
+    if not identifiers: return delivered
+    message = circuit_batch_tweet(codes)
+    batch_key = "circuit-caption:" + ",".join(str(ident) for ident in identifiers)
+    if dry_run:
+        logging.info("DRY RUN DKB ortak metni: %s", message)
+    elif store.state_value(batch_key) != "sent" and telegram_send(message):
+        store.set_state(batch_key, "sent")
+        logging.info("Telegram DKB ortak metni gönderildi: %s", batch_key)
+    return delivered
+
 def deliver(store, ident, item, detail, dry_run):
     important = is_important(item, detail)
     store.save(ident, important, text_of(detail.get("subject")))
@@ -637,15 +698,7 @@ def deliver(store, ident, item, detail, dry_run):
     card = None
     try:
         if is_circuit:
-            code = stocks(detail)[0]
-            try:
-                market = yahoo_chart(code)
-            except Exception as error:
-                # A pre-open/closed market can have no Yahoo quote or candles.
-                # Keep the DKB alert visible and label the unavailable fields.
-                logging.warning("Yahoo fiyatı hazır değil (%s); veri bekleniyor kartı gönderiliyor", type(error).__name__)
-                market = {"name": code, "price": None, "change_pct": None, "points": []}
-            card = render_circuit_card(code, market)
+            card = build_circuit_card(stocks(detail)[0])
         elif event: card = render_event_card(event[0], event[1], detail)
     except Exception as error:
         logging.warning("KAP görseli üretilemedi (%s); sade metin gönderiliyor", error)
@@ -686,14 +739,21 @@ def run_public_once(store, dry_run=False):
         store.set_cursor(cursor, cursor_key)
         logging.info("Canlı KAP başlangıç imleci: %s", cursor)
         return 0
-    ident = cursor + 1
-    result = PublicKapClient().detail(ident)
-    if result is None:
-        logging.info("Yeni canlı KAP bildirimi yok (beklenen ID %s)", ident)
+    batch_size = max(1, int(cfg("PUBLIC_BATCH_SIZE", "20")))
+    entries = []
+    for ident in range(cursor + 1, cursor + batch_size + 1):
+        result = PublicKapClient().detail(ident)
+        if result is None: break
+        item, detail = result
+        entries.append((ident, item, detail))
+    if not entries:
+        logging.info("Yeni canlı KAP bildirimi yok (beklenen ID %s)", cursor + 1)
         return 0
-    item, detail = result
-    count = deliver(store, ident, item, detail, dry_run)
-    store.set_cursor(ident, cursor_key)
+    circuits = [entry for entry in entries if (special_event(entry[2]) or (None,))[0] == "circuit"]
+    circuit_ids = {entry[0] for entry in circuits}
+    count = sum(deliver(store, ident, item, detail, dry_run) for ident, item, detail in entries if ident not in circuit_ids)
+    count += deliver_circuit_batch(store, circuits, dry_run)
+    store.set_cursor(entries[-1][0], cursor_key)
     return count
 
 def run_once(store, dry_run=False):

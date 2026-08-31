@@ -35,6 +35,9 @@ class KapBotTests(unittest.TestCase):
     def test_circuit_tweet_is_short_and_ready_to_post(self):
         self.assertEqual(kap_bot.circuit_tweet("HEDEF"), "#HEDEF Devre kesti. #borsa #bist")
 
+    def test_circuit_batch_tweet_combines_unique_tickers(self):
+        self.assertEqual(kap_bot.circuit_batch_tweet(["HEDEF", "ALVES", "HEDEF"]), "#HEDEF #ALVES Devre kesti. #borsa #bist")
+
     def test_circuit_card_discloses_delayed_yahoo_price_data(self):
         self.assertEqual(kap_bot.CIRCUIT_DATA_NOTE, "Not: KAP haberi anlık; fiyat ve % değişim Yahoo Finance kaynaklı, yaklaşık 15 dk gecikmeli.")
 
@@ -82,6 +85,7 @@ class KapBotTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:
             store = kap_bot.Store(Path(directory) / "test.sqlite3")
+            self.addCleanup(store.close)
             store.save(123, True, "Test")
             self.assertFalse(store.telegram_link_sent(123))
             store.mark_telegram_link_sent(123)
@@ -91,6 +95,7 @@ class KapBotTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:
             store = kap_bot.Store(Path(directory) / "test.sqlite3")
+            self.addCleanup(store.close)
             calls = []
             original_photo, original_message = kap_bot.telegram_send_photo, kap_bot.telegram_send
             original_card = kap_bot.render_event_card
@@ -107,6 +112,36 @@ class KapBotTests(unittest.TestCase):
                 kap_bot.render_event_card = original_card
             self.assertEqual([kind for kind, _ in calls], ["photo", "link"])
             self.assertEqual(calls[1][1], detail["link"])
+
+    def test_circuit_batch_sends_each_card_then_one_shared_tweet(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            store = kap_bot.Store(Path(directory) / "test.sqlite3")
+            self.addCleanup(store.close)
+            calls = []
+            original_photo, original_message = kap_bot.telegram_send_photo, kap_bot.telegram_send
+            original_card = kap_bot.build_circuit_card
+            try:
+                def card(code):
+                    path = Path(directory) / f"{code}.png"
+                    path.touch()
+                    return str(path)
+                kap_bot.build_circuit_card = card
+                kap_bot.telegram_send_photo = lambda path, text: calls.append(("photo", Path(path).stem, text)) or True
+                kap_bot.telegram_send = lambda text: calls.append(("text", text)) or True
+                item = {"disclosureType": "DKB"}
+                details = [
+                    {"subject": {"tr": "Pay Bazında Devre Kesici Bildirimi"}, "summary": {"tr": "Devre kesici"}, "relatedStocks": [{"code": code}]}
+                    for code in ("HEDEF", "ALVES", "KPEKS")
+                ]
+                entries = [(index, item, detail) for index, detail in enumerate(details, 100)]
+                kap_bot.deliver_circuit_batch(store, entries)
+            finally:
+                kap_bot.telegram_send_photo, kap_bot.telegram_send = original_photo, original_message
+                kap_bot.build_circuit_card = original_card
+            self.assertEqual([call[0] for call in calls], ["photo", "photo", "photo", "text"])
+            self.assertTrue(all(call[2] == "" for call in calls[:3]))
+            self.assertEqual(calls[-1][1], "#HEDEF #ALVES #KPEKS Devre kesti. #borsa #bist")
 
     def test_ai_tweet_finalizer_removes_link_and_keeps_tags(self):
         result = kap_bot.finalise_ai_tweet("Şirket sözleşme imzaladı. https://example.com", ["BRLSM"])
