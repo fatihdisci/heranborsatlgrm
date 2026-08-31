@@ -129,19 +129,41 @@ class KapBotTests(unittest.TestCase):
                 kap_bot.build_circuit_card = card
                 kap_bot.telegram_send_photo = lambda path, text: calls.append(("photo", Path(path).stem, text)) or True
                 kap_bot.telegram_send = lambda text: calls.append(("text", text)) or True
-                item = {"disclosureType": "DKB"}
-                details = [
-                    {"subject": {"tr": "Pay Bazında Devre Kesici Bildirimi"}, "summary": {"tr": "Devre kesici"}, "relatedStocks": [{"code": code}]}
-                    for code in ("HEDEF", "ALVES", "KPEKS")
-                ]
-                entries = [(index, item, detail) for index, detail in enumerate(details, 100)]
-                kap_bot.deliver_circuit_batch(store, entries)
+                for index, code in enumerate(("HEDEF", "ALVES", "KPEKS"), 100):
+                    store.save(index, True, "Pay Bazında Devre Kesici Bildirimi")
+                    store.queue_circuit(index, code)
+                store.db.execute("UPDATE circuit_queue SET queued_at=0")
+                store.db.commit()
+                kap_bot.flush_circuit_queue(store)
             finally:
                 kap_bot.telegram_send_photo, kap_bot.telegram_send = original_photo, original_message
                 kap_bot.build_circuit_card = original_card
             self.assertEqual([call[0] for call in calls], ["photo", "photo", "photo", "text"])
             self.assertTrue(all(call[2] == "" for call in calls[:3]))
             self.assertEqual(calls[-1][1], "#HEDEF #ALVES #KPEKS Devre kesti. #borsa #bist")
+
+    def test_single_circuit_keeps_caption_with_its_own_card(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            store = kap_bot.Store(Path(directory) / "test.sqlite3")
+            self.addCleanup(store.close)
+            calls = []
+            original_photo, original_card = kap_bot.telegram_send_photo, kap_bot.build_circuit_card
+            try:
+                def card(code):
+                    path = Path(directory) / f"{code}.png"
+                    path.touch()
+                    return str(path)
+                kap_bot.build_circuit_card = card
+                kap_bot.telegram_send_photo = lambda path, text: calls.append((Path(path).stem, text)) or True
+                store.save(100, True, "Pay Bazında Devre Kesici Bildirimi")
+                store.queue_circuit(100, "HEDEF")
+                store.db.execute("UPDATE circuit_queue SET queued_at=0")
+                store.db.commit()
+                kap_bot.flush_circuit_queue(store)
+            finally:
+                kap_bot.telegram_send_photo, kap_bot.build_circuit_card = original_photo, original_card
+            self.assertEqual(calls, [("HEDEF", "#HEDEF Devre kesti. #borsa #bist")])
 
     def test_ai_tweet_finalizer_removes_link_and_keeps_tags(self):
         result = kap_bot.finalise_ai_tweet("Şirket sözleşme imzaladı. https://example.com", ["BRLSM"])

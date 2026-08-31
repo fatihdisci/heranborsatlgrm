@@ -92,6 +92,7 @@ class Store:
         self.db = sqlite3.connect(path)
         self.db.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS disclosures (id INTEGER PRIMARY KEY, important INTEGER NOT NULL, telegram_sent INTEGER NOT NULL DEFAULT 0, title TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS circuit_queue (id INTEGER PRIMARY KEY, code TEXT NOT NULL, queued_at REAL NOT NULL)")
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(disclosures)")}
         if "x_post_id" not in columns: self.db.execute("ALTER TABLE disclosures ADD COLUMN x_post_id TEXT")
         if "telegram_link_sent" not in columns: self.db.execute("ALTER TABLE disclosures ADD COLUMN telegram_link_sent INTEGER NOT NULL DEFAULT 0")
@@ -119,6 +120,13 @@ class Store:
         row = self.db.execute("SELECT x_post_id FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
     def mark_x_posted(self, ident, post_id):
         self.db.execute("UPDATE disclosures SET x_post_id=? WHERE id=?", (str(post_id), ident)); self.db.commit()
+    def queue_circuit(self, ident, code):
+        self.db.execute("INSERT OR IGNORE INTO circuit_queue(id,code,queued_at) VALUES(?,?,?)", (ident, code, time.time())); self.db.commit()
+    def queued_circuits(self):
+        return self.db.execute("SELECT id,code,queued_at FROM circuit_queue ORDER BY id").fetchall()
+    def remove_queued_circuits(self, identifiers):
+        if not identifiers: return
+        self.db.executemany("DELETE FROM circuit_queue WHERE id=?", ((ident,) for ident in identifiers)); self.db.commit()
     def close(self): self.db.close()
 
 KEYWORDS = re.compile(r"temettü|bedelli|bedelsiz|sermaye artır|geri alım|ihale sonucu|sözleşme\w*\s+imzalan|iş ilişkisi|yatırım projesi|kapasite artış|birleşme|satın alma|finansal sonuç|net kâr|net zarar|iflas|konkordato|geri alım programı|pay alım satım|özel durum|devre kesici|sürekli işleme ara|tek fiyat emir toplama|faaliyet.*durdur|imkansız hale", re.I)
@@ -645,18 +653,16 @@ def build_circuit_card(code):
         market = {"name": code, "price": None, "change_pct": None, "points": []}
     return render_circuit_card(code, market)
 
-def deliver_circuit_batch(store, disclosures, dry_run=False):
-    """Send every DKB card, then one combined ready-to-post tweet caption."""
-    delivered, codes, identifiers = 0, [], []
-    for ident, item, detail in disclosures:
-        important = is_important(item, detail)
-        store.save(ident, important, text_of(detail.get("subject")))
-        if not important: continue
-        code_list = stocks(detail)
-        if not code_list: continue
-        code = code_list[0]
-        identifiers.append(ident)
-        codes.append(code)
+def flush_circuit_queue(store, dry_run=False):
+    """Send a solo DKB normally, or a quiet-period burst as one caption."""
+    queued = store.queued_circuits()
+    if not queued: return 0
+    quiet_seconds = max(1, int(cfg("CIRCUIT_BATCH_QUIET_SECONDS", "45")))
+    if time.time() - max(row[2] for row in queued) < quiet_seconds: return 0
+    identifiers, codes = [row[0] for row in queued], [row[1] for row in queued]
+    is_batch = len(queued) > 1
+    delivered = 0
+    for ident, code, _ in queued:
         if dry_run:
             logging.info("DRY RUN DKB kartı: %s", code)
             delivered += 1
@@ -667,9 +673,8 @@ def deliver_circuit_batch(store, disclosures, dry_run=False):
         card = None
         try:
             card = build_circuit_card(code)
-            # DKB cards are media-only; the shared caption is sent after the
-            # whole batch so the user gets one copy-ready tweet text.
-            if telegram_send_photo(card, ""):
+            caption = "" if is_batch else circuit_tweet(code)
+            if telegram_send_photo(card, caption):
                 store.mark_telegram_sent(ident)
                 delivered += 1
                 logging.info("Telegram DKB görseli gönderildi: %s", ident)
@@ -677,14 +682,15 @@ def deliver_circuit_batch(store, disclosures, dry_run=False):
             logging.exception("DKB görseli gönderilemedi: %s", ident)
         finally:
             if card: Path(card).unlink(missing_ok=True)
-    if not identifiers: return delivered
-    message = circuit_batch_tweet(codes)
-    batch_key = "circuit-caption:" + ",".join(str(ident) for ident in identifiers)
-    if dry_run:
-        logging.info("DRY RUN DKB ortak metni: %s", message)
-    elif store.state_value(batch_key) != "sent" and telegram_send(message):
-        store.set_state(batch_key, "sent")
-        logging.info("Telegram DKB ortak metni gönderildi: %s", batch_key)
+    if not all(store.telegram_sent(ident) for ident in identifiers): return delivered
+    if is_batch:
+        message = circuit_batch_tweet(codes)
+        if dry_run:
+            logging.info("DRY RUN DKB ortak metni: %s", message)
+        elif not telegram_send(message):
+            return delivered
+        logging.info("Telegram DKB ortak metni gönderildi: %s", ",".join(map(str, identifiers)))
+    if not dry_run: store.remove_queued_circuits(identifiers)
     return delivered
 
 def deliver(store, ident, item, detail, dry_run):
@@ -748,11 +754,16 @@ def run_public_once(store, dry_run=False):
         entries.append((ident, item, detail))
     if not entries:
         logging.info("Yeni canlı KAP bildirimi yok (beklenen ID %s)", cursor + 1)
-        return 0
+        return flush_circuit_queue(store, dry_run)
     circuits = [entry for entry in entries if (special_event(entry[2]) or (None,))[0] == "circuit"]
     circuit_ids = {entry[0] for entry in circuits}
     count = sum(deliver(store, ident, item, detail, dry_run) for ident, item, detail in entries if ident not in circuit_ids)
-    count += deliver_circuit_batch(store, circuits, dry_run)
+    for ident, item, detail in circuits:
+        important = is_important(item, detail)
+        store.save(ident, important, text_of(detail.get("subject")))
+        code_list = stocks(detail)
+        if important and code_list: store.queue_circuit(ident, code_list[0])
+    count += flush_circuit_queue(store, dry_run)
     store.set_cursor(entries[-1][0], cursor_key)
     return count
 
