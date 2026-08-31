@@ -145,6 +145,16 @@ class KapBotTests(unittest.TestCase):
             self.assertEqual(image.size, (1200, 675))
         Path(path).unlink()
 
+    def test_circuit_card_still_renders_when_yahoo_has_no_intraday_points(self):
+        path = kap_bot.render_circuit_card("ALVES", {"name": "Alves Kablo", "price": 1.6, "change_pct": 0.0, "points": []})
+        with Image.open(path) as image: self.assertEqual(image.size, (1200, 675))
+        Path(path).unlink()
+
+    def test_circuit_card_still_renders_when_yahoo_quote_is_unavailable(self):
+        path = kap_bot.render_circuit_card("ALVES", {"name": "ALVES", "price": None, "change_pct": None, "points": []})
+        with Image.open(path) as image: self.assertEqual(image.size, (1200, 675))
+        Path(path).unlink()
+
     def test_oauth_header_is_created(self):
         original = {key: os.environ.get(key) for key in ("X_API_KEY", "X_API_KEY_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET")}
         os.environ.update({"X_API_KEY": "key", "X_API_KEY_SECRET": "secret", "X_ACCESS_TOKEN": "token", "X_ACCESS_TOKEN_SECRET": "token-secret"})

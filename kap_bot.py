@@ -330,7 +330,11 @@ def yahoo_chart(code):
     points = [value for value in quote.get("close", []) if isinstance(value, (int, float))]
     price = meta.get("regularMarketPrice")
     previous = meta.get("chartPreviousClose") or meta.get("previousClose")
-    if not isinstance(price, (int, float)) or not isinstance(previous, (int, float)) or not points: raise ValueError("Yahoo fiyat verisi eksik")
+    # Yahoo can provide the current/previous quote while returning no intraday
+    # candles (common outside trading hours). The card can still be useful;
+    # the renderer will show a clear no-chart note instead of dropping the
+    # entire DKB image.
+    if not isinstance(price, (int, float)) or not isinstance(previous, (int, float)): raise ValueError("Yahoo fiyat verisi eksik")
     return {"name": meta.get("longName") or code, "price": price, "change_pct": (price - previous) / previous * 100, "points": points}
 
 def card_font(size, bold=False):
@@ -407,16 +411,23 @@ def render_circuit_card(code, market):
     draw.text((90, 82), "DEVRE KESİCİ", font=card_font(30, True), fill=red)
     draw.text((90, 126), f"#{code}", font=card_font(64, True), fill=dark)
     draw.text((92, 205), str(market["name"])[:38], font=card_font(27), fill=muted)
-    price = (f"{market['price']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")) + " TL"
-    draw.text((90, 250), price, font=card_font(54, True), fill=dark)
-    change = f"%{market['change_pct']:+.2f}".replace(".", ",")
-    draw.text((375, 270), change, font=card_font(30, True), fill=red if market["change_pct"] < 0 else "#27805C")
+    if isinstance(market.get("price"), (int, float)):
+        price = (f"{market['price']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")) + " TL"
+        draw.text((90, 250), price, font=card_font(54, True), fill=dark)
+    else:
+        draw.text((90, 265), "Fiyat verisi bekleniyor", font=card_font(30, True), fill=muted)
+    if isinstance(market.get("change_pct"), (int, float)):
+        change = f"%{market['change_pct']:+.2f}".replace(".", ",")
+        draw.text((375, 270), change, font=card_font(30, True), fill=red if market["change_pct"] < 0 else "#27805C")
     points = market["points"]
-    low, high = min(points), max(points)
     left, top, right, bottom = 90, 350, 1110, 535
-    if high == low: high += 1
-    coords = [(left + i * (right-left)/(len(points)-1), bottom - (point-low)/(high-low)*(bottom-top)) for i, point in enumerate(points)] if len(points) > 1 else []
-    if coords: draw.line(coords, fill=red, width=6, joint="curve")
+    if points:
+        low, high = min(points), max(points)
+        if high == low: high += 1
+        coords = [(left + i * (right-left)/(len(points)-1), bottom - (point-low)/(high-low)*(bottom-top)) for i, point in enumerate(points)] if len(points) > 1 else []
+        if coords: draw.line(coords, fill=red, width=6, joint="curve")
+    else:
+        draw.text((90, 420), "Grafik verisi şu an alınamadı.", font=card_font(27, True), fill=muted)
     draw.line((left, bottom, right, bottom), fill="#ECEAE6", width=2)
     draw.text((90, 552), "İşlemler tek fiyat yöntemiyle devam ediyor.", font=card_font(21), fill=muted)
     draw.text((90, 582), CIRCUIT_DATA_NOTE, font=card_font(16), fill=muted)
@@ -625,7 +636,16 @@ def deliver(store, ident, item, detail, dry_run):
     message = fallback if is_circuit else (ai_tweet(detail, event[0] if event else None) or fallback)
     card = None
     try:
-        if is_circuit: card = render_circuit_card(stocks(detail)[0], yahoo_chart(stocks(detail)[0]))
+        if is_circuit:
+            code = stocks(detail)[0]
+            try:
+                market = yahoo_chart(code)
+            except Exception as error:
+                # A pre-open/closed market can have no Yahoo quote or candles.
+                # Keep the DKB alert visible and label the unavailable fields.
+                logging.warning("Yahoo fiyatı hazır değil (%s); veri bekleniyor kartı gönderiliyor", type(error).__name__)
+                market = {"name": code, "price": None, "change_pct": None, "points": []}
+            card = render_circuit_card(code, market)
         elif event: card = render_event_card(event[0], event[1], detail)
     except Exception as error:
         logging.warning("KAP görseli üretilemedi (%s); sade metin gönderiliyor", error)
