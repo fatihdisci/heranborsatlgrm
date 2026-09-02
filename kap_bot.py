@@ -388,14 +388,6 @@ def wrap_card_text(draw, text, font, max_width, max_lines):
     if line and len(lines) < max_lines: lines.append(line)
     return lines
 
-def display_company(detail):
-    title = clean(detail.get("senderTitle", ""))
-    # Legal titles are generally much too long for an editorial company line.
-    # Stop before the first sector/legal descriptor, leaving the recognisable
-    # company name (for example, "BİRLEŞİM MÜHENDİSLİK").
-    title = re.sub(r"\s+(SANAYİ|TİCARET|ÜRETİM|HİZMETLERİ|YATIRIM|ISITMA|SOĞUTMA|HAVALANDIRMA|İNŞAAT|ELEKTRİK|VE)\b.*$", "", title, flags=re.I).strip()
-    return title or " ".join(stocks(detail))
-
 def card_amount(detail):
     text = disclosure_text(detail)
     match = re.search(r"\b\d{1,3}(?:[.]\d{3})+(?:,\d+)?\s*(?:TL|USD|EUR)\b|\b\d+(?:[.,]\d+)?\s*(?:milyon|milyar)\s*(?:TL|USD|EUR)\b", text, re.I)
@@ -428,15 +420,14 @@ def render_circuit_card(code, market):
     dark, muted, red = "#141414", "#747474", "#D65A4A"
     draw.text((90, 82), "DEVRE KESİCİ", font=card_font(30, True), fill=red)
     draw.text((90, 126), f"#{code}", font=card_font(64, True), fill=dark)
-    draw.text((92, 205), str(market["name"])[:38], font=card_font(27), fill=muted)
     if isinstance(market.get("price"), (int, float)):
         price = (f"{market['price']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")) + " TL"
-        draw.text((90, 250), price, font=card_font(54, True), fill=dark)
+        draw.text((90, 220), price, font=card_font(54, True), fill=dark)
     else:
-        draw.text((90, 265), "Fiyat verisi bekleniyor", font=card_font(30, True), fill=muted)
+        draw.text((90, 235), "Fiyat verisi bekleniyor", font=card_font(30, True), fill=muted)
     if isinstance(market.get("change_pct"), (int, float)):
         change = f"%{market['change_pct']:+.2f}".replace(".", ",")
-        draw.text((375, 270), change, font=card_font(30, True), fill=red if market["change_pct"] < 0 else "#27805C")
+        draw.text((375, 240), change, font=card_font(30, True), fill=red if market["change_pct"] < 0 else "#27805C")
     points = market["points"]
     left, top, right, bottom = 90, 350, 1110, 535
     if points:
@@ -464,9 +455,7 @@ def render_event_card(event, label, detail):
     for index, line in enumerate(headline_lines): draw.text((56, 95 + index * 55), line, font=headline_font, fill=dark)
     y = 95 + len(headline_lines) * 60 + 24
     draw.text((56, y), "  ".join(f"#{code}" for code in codes), font=card_font(31, True), fill=gold)
-    y += 52
-    draw.text((56, y), display_company(detail)[:42], font=card_font(23), fill=muted)
-    y += 64
+    y += 72
     summary_font = card_font(30)
     lines = wrap_card_text(draw, event_summary(detail, event, 330), summary_font, 610, 7)
     for index, line in enumerate(lines): draw.text((56, y + index * 37), line, font=summary_font, fill="#202020")

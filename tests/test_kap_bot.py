@@ -175,7 +175,7 @@ class KapBotTests(unittest.TestCase):
         self.assertEqual(kap_bot.extract_disclosure_content(source), "İlk ayrıntı. İkinci ayrıntı.")
 
     def test_event_card_renders(self):
-        detail = {"summary": {"tr": "Şirket yeni bir iş ilişkisi açıkladı."}, "senderTitle": "BİRLEŞİM MÜHENDİSLİK ISITMA SOĞUTMA HAVALANDIRMA SANAYİ VE TİCARET A.Ş.", "relatedStocks": [{"code": "BRLSM"}]}
+        detail = {"summary": {"tr": "Şirket yeni bir iş ilişkisi açıkladı."}, "relatedStocks": [{"code": "BRLSM"}]}
         path = kap_bot.render_event_card("business", "YENİ İŞ İLİŞKİSİ", detail)
         with Image.open(path) as image: self.assertEqual(image.size, (720, 1280))
         Path(path).unlink()
