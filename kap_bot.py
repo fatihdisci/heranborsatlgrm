@@ -629,8 +629,18 @@ def x_upload_image(path):
     return response["data"]["id"]
 
 def x_post_circuit_breaker(code, image_path):
-    media_id = x_upload_image(image_path)
-    response = x_request("POST", "https://api.x.com/2/tweets", {"text": f"#{code} Devre kesti. #borsa #bist", "media": {"media_ids": [media_id]}})
+    return x_post_circuit_batch([code], [image_path])
+
+def x_post_circuit_batch(codes, image_paths):
+    """Post up to four DKB cards as one X post with one shared caption."""
+    selected_paths = list(image_paths)[:4]  # X accepts at most four images per post.
+    if not selected_paths:
+        raise ValueError("X paylaşımı için DKB görseli yok")
+    if len(image_paths) > len(selected_paths):
+        logging.warning("X tek gönderide en fazla dört görsel destekliyor; %s DKB görseli atlandı", len(image_paths) - len(selected_paths))
+    media_ids = [x_upload_image(path) for path in selected_paths]
+    message = circuit_tweet(codes[0]) if len(codes) == 1 else circuit_batch_tweet(codes)
+    response = x_request("POST", "https://api.x.com/2/tweets", {"text": message, "media": {"media_ids": media_ids}})
     return response["data"]["id"]
 
 def build_circuit_card(code):
@@ -643,7 +653,7 @@ def build_circuit_card(code):
     return render_circuit_card(code, market)
 
 def flush_circuit_queue(store, dry_run=False):
-    """Send a solo DKB normally, or a quiet-period burst as one caption."""
+    """Send a solo DKB normally, or a quiet-period burst as one grouped post."""
     queued = store.queued_circuits()
     if not queued: return 0
     quiet_seconds = max(1, int(cfg("CIRCUIT_BATCH_QUIET_SECONDS", "45")))
@@ -651,36 +661,49 @@ def flush_circuit_queue(store, dry_run=False):
     identifiers, codes = [row[0] for row in queued], [row[1] for row in queued]
     is_batch = len(queued) > 1
     delivered = 0
-    for ident, code, _ in queued:
-        if dry_run:
-            logging.info("DRY RUN DKB kartı: %s", code)
-            delivered += 1
-            continue
-        if store.telegram_sent(ident):
-            delivered += 1
-            continue
-        card = None
-        try:
-            card = build_circuit_card(code)
-            caption = "" if is_batch else circuit_tweet(code)
-            if telegram_send_photo(card, caption):
-                store.mark_telegram_sent(ident)
+    cards = {}
+    try:
+        for ident, code, _ in queued:
+            if dry_run:
+                logging.info("DRY RUN DKB kartı: %s", code)
                 delivered += 1
-                logging.info("Telegram DKB görseli gönderildi: %s", ident)
-        except Exception:
-            logging.exception("DKB görseli gönderilemedi: %s", ident)
-        finally:
-            if card: Path(card).unlink(missing_ok=True)
-    if not all(store.telegram_sent(ident) for ident in identifiers): return delivered
-    if is_batch:
-        message = circuit_batch_tweet(codes)
-        if dry_run:
-            logging.info("DRY RUN DKB ortak metni: %s", message)
-        elif not telegram_send(message):
-            return delivered
-        logging.info("Telegram DKB ortak metni gönderildi: %s", ",".join(map(str, identifiers)))
-    if not dry_run: store.remove_queued_circuits(identifiers)
-    return delivered
+                continue
+            try:
+                # Keep every card until the X post is sent, so a burst uses
+                # the same individual visuals on Telegram and X.
+                cards[ident] = build_circuit_card(code)
+                if store.telegram_sent(ident):
+                    delivered += 1
+                    continue
+                caption = "" if is_batch else circuit_tweet(code)
+                if telegram_send_photo(cards[ident], caption):
+                    store.mark_telegram_sent(ident)
+                    delivered += 1
+                    logging.info("Telegram DKB görseli gönderildi: %s", ident)
+            except Exception:
+                logging.exception("DKB görseli gönderilemedi: %s", ident)
+        if not all(store.telegram_sent(ident) for ident in identifiers): return delivered
+        if is_batch:
+            message = circuit_batch_tweet(codes)
+            if dry_run:
+                logging.info("DRY RUN DKB ortak metni: %s", message)
+            elif not telegram_send(message):
+                return delivered
+            logging.info("Telegram DKB ortak metni gönderildi: %s", ",".join(map(str, identifiers)))
+        if not dry_run and cfg("X_AUTO_POST_DKB", "false").lower() == "true":
+            if not any(store.x_posted(ident) for ident in identifiers):
+                try:
+                    post_id = x_post_circuit_batch(codes, [cards[ident] for ident in identifiers])
+                    for ident in identifiers: store.mark_x_posted(ident, post_id)
+                    logging.info("X DKB paylaşımı yapıldı: %s", ",".join(map(str, identifiers)))
+                except Exception:
+                    logging.exception("X DKB paylaşımı başarısız: %s", ",".join(map(str, identifiers)))
+            elif not all(store.x_posted(ident) for ident in identifiers):
+                logging.warning("DKB grubu kısmen X'e aktarılmış; tekrar paylaşım yapılmadı: %s", ",".join(map(str, identifiers)))
+        if not dry_run: store.remove_queued_circuits(identifiers)
+        return delivered
+    finally:
+        for card in cards.values(): Path(card).unlink(missing_ok=True)
 
 def deliver(store, ident, item, detail, dry_run):
     important = is_important(item, detail)
