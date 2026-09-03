@@ -14,6 +14,16 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 CIRCUIT_DATA_NOTE = "Not: KAP haberi anlık; fiyat ve % değişim Yahoo Finance kaynaklı, yaklaşık 15 dk gecikmeli."
+# The BIST 30 constituents below are valid for the July–September 2026 index
+# period. The remaining tickers are the user's explicit DKB watchlist.
+DEFAULT_X_DKB_AUTO_POST_TICKERS = frozenset({
+    "AEFES", "AKBNK", "ALBTN", "ASELS", "ASTOR", "BIMAS", "BKRGY", "CITAS",
+    "DSTKF", "EKGYO", "ENKAI", "EREGL", "FROTO", "GARAN", "GUBRF", "GUNDG",
+    "INTET", "ISCTR", "ISVEA", "KARCI", "KCHOL", "KPEKS", "KRDMD", "KTLEV",
+    "MASFN", "METEN", "MGROS", "ODINE", "OZATD", "PETKM", "PGSUS", "QUICK",
+    "SAHOL", "SARAF", "SASA", "SISE", "TAVHL", "TCELL", "THYAO",
+    "TKNKA", "TOASO", "TRALT", "TTKOM", "TUPRS", "VAKBN", "VEYAS", "YKBNK",
+})
 
 def load_env(path=ROOT / ".env"):
     if path.exists():
@@ -24,6 +34,12 @@ def load_env(path=ROOT / ".env"):
             os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 def cfg(key, default=None): return os.getenv(key, default)
+
+def x_dkb_auto_post_allowed(codes):
+    """Only the configured watchlist and BIST 30 may create automatic X posts."""
+    raw = cfg("X_DKB_AUTO_POST_TICKERS", "")
+    allowed = {code.strip().upper() for code in raw.split(",") if code.strip()} if raw else DEFAULT_X_DKB_AUTO_POST_TICKERS
+    return bool({str(code).upper() for code in codes} & allowed)
 
 class KapClient:
     def __init__(self):
@@ -709,7 +725,9 @@ def flush_circuit_queue(store, dry_run=False):
                 return delivered
             logging.info("Telegram DKB ortak metni gönderildi: %s", ",".join(map(str, identifiers)))
         if not dry_run and cfg("X_AUTO_POST_DKB", "false").lower() == "true":
-            if not any(store.x_posted(ident) for ident in identifiers):
+            if not x_dkb_auto_post_allowed(codes):
+                logging.info("X DKB paylaşımı izin listesi dışında kaldı: %s", ",".join(codes))
+            elif not any(store.x_posted(ident) for ident in identifiers):
                 try:
                     post_id = x_post_circuit_batch(codes, [cards[ident] for ident in identifiers])
                     for ident in identifiers: store.mark_x_posted(ident, post_id)
@@ -756,7 +774,7 @@ def deliver(store, ident, item, detail, dry_run):
                 logging.info("Telegram KAP linki gönderildi: %s", ident)
     # Even if this explicit switch is enabled later, only circuit breakers may
     # be posted automatically. All other KAP cards remain Telegram-only.
-    if is_circuit and card and cfg("X_AUTO_POST_DKB", "false").lower() == "true" and not store.x_posted(ident) and not dry_run:
+    if is_circuit and card and cfg("X_AUTO_POST_DKB", "false").lower() == "true" and x_dkb_auto_post_allowed(stocks(detail)) and not store.x_posted(ident) and not dry_run:
         try:
             post_id = x_post_circuit_breaker(stocks(detail)[0], card)
             store.mark_x_posted(ident, post_id)

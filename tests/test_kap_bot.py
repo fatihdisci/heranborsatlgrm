@@ -38,6 +38,12 @@ class KapBotTests(unittest.TestCase):
     def test_circuit_batch_tweet_combines_unique_tickers(self):
         self.assertEqual(kap_bot.circuit_batch_tweet(["HEDEF", "ALVES", "HEDEF"]), "#HEDEF #ALVES Devre kesti. #borsa #bist")
 
+    def test_x_dkb_auto_post_allowlist_includes_watchlist_and_bist30_only(self):
+        self.assertTrue(kap_bot.x_dkb_auto_post_allowed(["KPEKS"]))
+        self.assertTrue(kap_bot.x_dkb_auto_post_allowed(["AKBNK"]))
+        self.assertFalse(kap_bot.x_dkb_auto_post_allowed(["HEDEF"]))
+        self.assertTrue(kap_bot.x_dkb_auto_post_allowed(["HEDEF", "ASELS"]))
+
     def test_x_dkb_visuals_begin_at_1020_istanbul_time(self):
         zone = kap_bot.ZoneInfo("Europe/Istanbul")
         self.assertFalse(kap_bot.x_dkb_include_visuals(kap_bot.datetime(2026, 9, 3, 10, 19, tzinfo=zone)))
