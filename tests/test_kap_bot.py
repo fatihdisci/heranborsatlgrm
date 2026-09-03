@@ -38,6 +38,22 @@ class KapBotTests(unittest.TestCase):
     def test_circuit_batch_tweet_combines_unique_tickers(self):
         self.assertEqual(kap_bot.circuit_batch_tweet(["HEDEF", "ALVES", "HEDEF"]), "#HEDEF #ALVES Devre kesti. #borsa #bist")
 
+    def test_x_dkb_visuals_begin_at_1020_istanbul_time(self):
+        zone = kap_bot.ZoneInfo("Europe/Istanbul")
+        self.assertFalse(kap_bot.x_dkb_include_visuals(kap_bot.datetime(2026, 9, 3, 10, 19, tzinfo=zone)))
+        self.assertTrue(kap_bot.x_dkb_include_visuals(kap_bot.datetime(2026, 9, 3, 10, 20, tzinfo=zone)))
+
+    def test_x_dkb_post_before_1020_is_text_only(self):
+        original_include, original_request = kap_bot.x_dkb_include_visuals, kap_bot.x_request
+        calls = []
+        try:
+            kap_bot.x_dkb_include_visuals = lambda: False
+            kap_bot.x_request = lambda method, url, payload: calls.append(payload) or {"data": {"id": "text-only"}}
+            self.assertEqual(kap_bot.x_post_circuit_batch(["HEDEF", "ALVES"], ["one.png", "two.png"]), "text-only")
+        finally:
+            kap_bot.x_dkb_include_visuals, kap_bot.x_request = original_include, original_request
+        self.assertEqual(calls, [{"text": "#HEDEF #ALVES Devre kesti. #borsa #bist"}])
+
     def test_circuit_card_discloses_delayed_yahoo_price_data(self):
         self.assertEqual(kap_bot.CIRCUIT_DATA_NOTE, "Not: KAP haberi anlık; fiyat ve % değişim Yahoo Finance kaynaklı, yaklaşık 15 dk gecikmeli.")
 

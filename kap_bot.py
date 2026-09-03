@@ -2,11 +2,13 @@
 """KAP test API -> important disclosure -> Turkish draft -> Telegram."""
 import argparse, base64, hashlib, hmac, html, json, os, re, secrets, sqlite3, time, tempfile, webbrowser
 import logging
+from datetime import datetime, time as clock_time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 ROOT = Path(__file__).resolve().parent
@@ -248,6 +250,18 @@ def circuit_batch_tweet(codes):
     """One ready-to-post tweet for all circuit breakers found in a poll."""
     unique = list(dict.fromkeys(code for code in codes if code))
     return required_tags(f"{' '.join(f'#{code}' for code in unique)} Devre kesti.", unique)
+
+def x_dkb_include_visuals(now=None):
+    """Wait for the delayed Yahoo quote before attaching DKB cards to X."""
+    start = cfg("X_DKB_VISUAL_START_TIME", "10:20")
+    try:
+        hour, minute = (int(part) for part in start.split(":", 1))
+        threshold = clock_time(hour, minute)
+    except (TypeError, ValueError):
+        logging.warning("X_DKB_VISUAL_START_TIME geçersiz; X DKB görselleri bekletiliyor")
+        return False
+    current = now or datetime.now(ZoneInfo("Europe/Istanbul"))
+    return current.timetz().replace(tzinfo=None) >= threshold
 
 def event_tweet(event, detail):
     codes = stocks(detail)
@@ -633,14 +647,18 @@ def x_post_circuit_breaker(code, image_path):
 
 def x_post_circuit_batch(codes, image_paths):
     """Post up to four DKB cards as one X post with one shared caption."""
-    selected_paths = list(image_paths)[:4]  # X accepts at most four images per post.
-    if not selected_paths:
-        raise ValueError("X paylaşımı için DKB görseli yok")
-    if len(image_paths) > len(selected_paths):
-        logging.warning("X tek gönderide en fazla dört görsel destekliyor; %s DKB görseli atlandı", len(image_paths) - len(selected_paths))
-    media_ids = [x_upload_image(path) for path in selected_paths]
     message = circuit_tweet(codes[0]) if len(codes) == 1 else circuit_batch_tweet(codes)
-    response = x_request("POST", "https://api.x.com/2/tweets", {"text": message, "media": {"media_ids": media_ids}})
+    payload = {"text": message}
+    if x_dkb_include_visuals():
+        selected_paths = list(image_paths)[:4]  # X accepts at most four images per post.
+        if not selected_paths:
+            raise ValueError("X paylaşımı için DKB görseli yok")
+        if len(image_paths) > len(selected_paths):
+            logging.warning("X tek gönderide en fazla dört görsel destekliyor; %s DKB görseli atlandı", len(image_paths) - len(selected_paths))
+        payload["media"] = {"media_ids": [x_upload_image(path) for path in selected_paths]}
+    else:
+        logging.info("X DKB görseli %s öncesi Yahoo verisi gecikmesi nedeniyle eklenmedi", cfg("X_DKB_VISUAL_START_TIME", "10:20"))
+    response = x_request("POST", "https://api.x.com/2/tweets", payload)
     return response["data"]["id"]
 
 def build_circuit_card(code):
