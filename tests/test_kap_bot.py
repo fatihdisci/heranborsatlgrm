@@ -38,9 +38,12 @@ class KapBotTests(unittest.TestCase):
     def test_circuit_batch_tweet_combines_unique_tickers(self):
         self.assertEqual(kap_bot.circuit_batch_tweet(["HEDEF", "ALVES", "HEDEF"]), "#HEDEF #ALVES Devre kesti. #borsa #bist")
 
-    def test_x_dkb_auto_post_allowlist_includes_watchlist_and_bist30_only(self):
+    def test_x_dkb_auto_post_allowlist_includes_watchlist_and_bist100_only(self):
         self.assertTrue(kap_bot.x_dkb_auto_post_allowed(["KPEKS"]))
         self.assertTrue(kap_bot.x_dkb_auto_post_allowed(["AKBNK"]))
+        self.assertTrue(kap_bot.x_dkb_auto_post_allowed(["IEYHO"]))
+        self.assertEqual(len(kap_bot.BIST100_TICKERS), 100)
+        self.assertFalse(kap_bot.x_dkb_auto_post_allowed(["KONTR"]))
         self.assertFalse(kap_bot.x_dkb_auto_post_allowed(["HEDEF"]))
         self.assertTrue(kap_bot.x_dkb_auto_post_allowed(["HEDEF", "ASELS"]))
 

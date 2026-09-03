@@ -14,18 +14,35 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 CIRCUIT_DATA_NOTE = "Not: KAP haberi anlık; fiyat ve % değişim Yahoo Finance kaynaklı, yaklaşık 15 dk gecikmeli."
-# The BIST 30 constituents below are valid for the July–September 2026 index
-# period. The remaining tickers are the user's explicit DKB watchlist.
-DEFAULT_X_DKB_AUTO_POST_TICKERS = frozenset({
-    "AEFES", "AKBNK", "AKFYE", "AKSEN", "ALBTN", "ALFAS", "ASELS", "ASTOR",
-    "BETAE", "BIMAS", "BKRGY", "CITAS", "CWENE", "DSTKF", "EKGYO", "ENJSA",
-    "ENKAI", "EREGL", "EUPWR", "FROTO", "GARAN", "GESAN", "GUBRF", "GUNDG",
-    "GWIND", "INTET", "ISCTR", "ISVEA", "KARCI", "KCHOL", "KPEKS", "KRDMD",
-    "KTLEV", "MASFN", "METEN", "MGROS", "ODINE", "OZATD", "PETKM", "PGSUS",
-    "QUICK", "SAHOL", "SARAE", "SASA", "SAYAS", "SISE", "TAVHL",
-    "TCELL", "THYAO", "TKNKA", "TOASO", "TRALT", "TTKOM", "TUPRS", "VAKBN",
-    "VEYAS", "YKBNK",
+# BIST 100 constituents valid for the July–September 2026 index period.
+# KONTR was replaced by BERA mid-period; the three September-period changes
+# (ESEN, IEYHO and ODINE) are included here as well.
+BIST100_TICKERS = frozenset({
+    "AEFES", "AKBNK", "AKSA", "AKSEN", "ALARK", "ALTNY", "ANSGR", "ARCLK",
+    "ASELS", "ASTOR", "BALSU", "BERA", "BIMAS", "BRSAN", "BRYAT", "BSOKE",
+    "BTCIM", "CANTE", "CCOLA", "CIMSA", "CVKMD", "CWENE", "DAPGM", "DOAS",
+    "DOHOL", "DSTKF", "ECILC", "EFOR", "EKGYO", "ENERY", "ENJSA", "ENKAI",
+    "EREGL", "ESEN", "EUPWR", "EUREN", "FENER", "FROTO", "GARAN", "GENIL",
+    "GESAN", "GLRMK", "GRSEL", "GRTHO", "GSRAY", "GUBRF", "HALKB", "HEKTS",
+    "IEYHO", "ISCTR", "ISMEN", "IZENR", "KCHOL", "KLRHO", "KRDMD", "KTLEV",
+    "KUYAS", "MAGEN", "MAVI", "MGROS", "MIATK", "MPARK", "OBAMS", "ODAS",
+    "ODINE", "OTKAR", "OYAKC", "PAHOL", "PASEU", "PATEK", "PETKM", "PGSUS",
+    "PSGYO", "QUAGR", "RALYH", "REEDR", "SAHOL", "SARKY", "SASA", "SISE",
+    "SKBNK", "SOKM", "TAVHL", "TCELL", "THYAO", "TKFEN", "TOASO", "TRALT",
+    "TRENJ", "TRMET", "TSKB", "TTKOM", "TUKAS", "TUPRS", "TURSG", "ULKER",
+    "VAKBN", "VESTL", "YKBNK", "ZOREN",
 })
+
+# Extra DKB tickers explicitly selected by the user, in addition to BIST 100.
+CUSTOM_X_DKB_AUTO_POST_TICKERS = frozenset({
+    "AKFYE", "ALBTN", "ALFAS", "BETAE", "BKRGY", "CITAS", "GUNDG", "GWIND",
+    "INTET", "ISVEA", "KARCI", "KPEKS", "MASFN", "METEN", "OZATD", "QUICK",
+    "SARAE", "SAYAS", "TKNKA", "VEYAS",
+})
+
+DEFAULT_X_DKB_AUTO_POST_TICKERS = frozenset(
+    BIST100_TICKERS | CUSTOM_X_DKB_AUTO_POST_TICKERS
+)
 
 def load_env(path=ROOT / ".env"):
     if path.exists():
@@ -38,7 +55,7 @@ def load_env(path=ROOT / ".env"):
 def cfg(key, default=None): return os.getenv(key, default)
 
 def x_dkb_auto_post_allowed(codes):
-    """Only the configured watchlist and BIST 30 may create automatic X posts."""
+    """Only the configured watchlist and BIST 100 may create automatic X posts."""
     raw = cfg("X_DKB_AUTO_POST_TICKERS", "")
     allowed = {code.strip().upper() for code in raw.split(",") if code.strip()} if raw else DEFAULT_X_DKB_AUTO_POST_TICKERS
     return bool({str(code).upper() for code in codes} & allowed)
