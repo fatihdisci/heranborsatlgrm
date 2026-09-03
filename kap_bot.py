@@ -17,12 +17,14 @@ CIRCUIT_DATA_NOTE = "Not: KAP haberi anlık; fiyat ve % değişim Yahoo Finance 
 # The BIST 30 constituents below are valid for the July–September 2026 index
 # period. The remaining tickers are the user's explicit DKB watchlist.
 DEFAULT_X_DKB_AUTO_POST_TICKERS = frozenset({
-    "AEFES", "AKBNK", "ALBTN", "ASELS", "ASTOR", "BIMAS", "BKRGY", "CITAS",
-    "DSTKF", "EKGYO", "ENKAI", "EREGL", "FROTO", "GARAN", "GUBRF", "GUNDG",
-    "INTET", "ISCTR", "ISVEA", "KARCI", "KCHOL", "KPEKS", "KRDMD", "KTLEV",
-    "MASFN", "METEN", "MGROS", "ODINE", "OZATD", "PETKM", "PGSUS", "QUICK",
-    "SAHOL", "SARAF", "SASA", "SISE", "TAVHL", "TCELL", "THYAO",
-    "TKNKA", "TOASO", "TRALT", "TTKOM", "TUPRS", "VAKBN", "VEYAS", "YKBNK",
+    "AEFES", "AKBNK", "AKFYE", "AKSEN", "ALBTN", "ALFAS", "ASELS", "ASTOR",
+    "BETAE", "BIMAS", "BKRGY", "CITAS", "CWENE", "DSTKF", "EKGYO", "ENJSA",
+    "ENKAI", "EREGL", "EUPWR", "FROTO", "GARAN", "GESAN", "GUBRF", "GUNDG",
+    "GWIND", "INTET", "ISCTR", "ISVEA", "KARCI", "KCHOL", "KPEKS", "KRDMD",
+    "KTLEV", "MASFN", "METEN", "MGROS", "ODINE", "OZATD", "PETKM", "PGSUS",
+    "QUICK", "SAHOL", "SARAE", "SARAF", "SASA", "SAYAS", "SISE", "TAVHL",
+    "TCELL", "THYAO", "TKNKA", "TOASO", "TRALT", "TTKOM", "TUPRS", "VAKBN",
+    "VEYAS", "YKBNK",
 })
 
 def load_env(path=ROOT / ".env"):
