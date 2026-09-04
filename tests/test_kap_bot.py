@@ -9,6 +9,23 @@ import kap_bot
 
 
 class KapBotTests(unittest.TestCase):
+    def test_second_oauth_refresh_uses_the_rotated_token_in_same_process(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(kap_bot, "ROOT", Path(directory)), \
+             patch.object(kap_bot, "_x_oauth2_access_token", None), \
+             patch.dict(os.environ, {"X_OAUTH2_REFRESH_TOKEN": "test-refresh-0"}), \
+             patch.object(kap_bot, "x_oauth2_token_request", side_effect=[
+                 {"access_token": "test-access-1", "refresh_token": "test-refresh-1"},
+                 {"access_token": "test-access-2", "refresh_token": "test-refresh-2"},
+             ]) as exchange:
+            kap_bot.refresh_x_oauth2_token()
+            kap_bot.refresh_x_oauth2_token()
+            self.assertEqual([call.args[0]["refresh_token"] for call in exchange.call_args_list], ["test-refresh-0", "test-refresh-1"])
+            self.assertEqual(kap_bot.x_bearer_token(), "test-access-2")
+            self.assertIn("X_OAUTH2_REFRESH_TOKEN=test-refresh-2", (Path(directory) / ".env").read_text())
+
     def test_stock_validation_allows_bist_code_with_digit(self):
         detail = {"relatedStocks": [{"code": "AVGY0"}, {"code": "18"}]}
         self.assertEqual(kap_bot.stocks(detail), ["AVGY0"])
@@ -165,7 +182,7 @@ class KapBotTests(unittest.TestCase):
                 kap_bot.build_circuit_card = original_card
             self.assertEqual([call[0] for call in calls], ["photo", "photo", "photo", "text"])
             self.assertTrue(all(call[2] == "" for call in calls[:3]))
-            self.assertEqual(calls[-1][1], "#HEDEF #ALVES #KPEKS Devre kesti. #borsa #bist")
+            self.assertEqual(calls[-1][1], "#HEDEF #ALVES #KPEKS Devre kesti. #borsa #bist\n\n⏸ X'te paylaşılmadı: otomatik paylaşım kapalı.")
 
     def test_circuit_batch_posts_its_cards_in_one_x_post(self):
         import tempfile
@@ -246,7 +263,7 @@ class KapBotTests(unittest.TestCase):
                 kap_bot.logging.exception = original["log_exception"]
                 if original["X_AUTO_POST_DKB"] is None: os.environ.pop("X_AUTO_POST_DKB", None)
                 else: os.environ["X_AUTO_POST_DKB"] = original["X_AUTO_POST_DKB"]
-            self.assertEqual(messages, ["#AKBNK #ASELS Devre kesti. #borsa #bist"])
+            self.assertEqual(messages, ["#AKBNK #ASELS Devre kesti. #borsa #bist\n\n⏳ X paylaşımı bekleniyor."])
             self.assertEqual([row[0] for row in store.queued_circuits()], [100, 101])
 
     def test_single_circuit_keeps_caption_with_its_own_card(self):
@@ -270,7 +287,62 @@ class KapBotTests(unittest.TestCase):
                 kap_bot.flush_circuit_queue(store)
             finally:
                 kap_bot.telegram_send_photo, kap_bot.build_circuit_card = original_photo, original_card
-            self.assertEqual(calls, [("HEDEF", "#HEDEF Devre kesti. #borsa #bist")])
+            self.assertEqual(calls, [("HEDEF", "#HEDEF Devre kesti. #borsa #bist\n\n⏸ X'te paylaşılmadı: otomatik paylaşım kapalı.")])
+
+    def test_dkb_status_updates_same_telegram_message_without_changing_x_text(self):
+        import tempfile
+        from unittest.mock import patch
+        for codes in (["AKBNK"], ["AKBNK", "HEDEF"], ["HEDEF"]):
+            with self.subTest(codes=codes), tempfile.TemporaryDirectory() as directory:
+                store = kap_bot.Store(Path(directory) / "test.sqlite3")
+                self.addCleanup(store.close)
+                for ident, code in enumerate(codes, 100):
+                    store.save(ident, True, "DKB")
+                    store.queue_circuit(ident, code)
+                store.db.execute("UPDATE circuit_queue SET queued_at=0")
+                store.db.commit()
+                with patch.dict(os.environ, {"X_AUTO_POST_DKB": "true", "X_DKB_AUTO_POST_TICKERS": "AKBNK"}), \
+                     patch.object(kap_bot, "build_circuit_card", side_effect=lambda code: str(Path(directory) / f"{code}.png")), \
+                     patch.object(kap_bot, "telegram_send_photo", return_value=701) as photo, \
+                     patch.object(kap_bot, "telegram_send", return_value=702) as message, \
+                     patch.object(kap_bot, "telegram_edit_dkb", return_value=True) as edit, \
+                     patch.object(kap_bot, "x_dkb_include_visuals", return_value=False), \
+                     patch.object(kap_bot, "x_request", return_value={"data": {"id": "x-post"}}) as x_request:
+                    kap_bot.flush_circuit_queue(store)
+                    base = " ".join(f"#{code}" for code in codes) + " Devre kesti. #borsa #bist"
+                    if "AKBNK" in codes:
+                        self.assertEqual(x_request.call_args.args[2], {"text": base})
+                        edit.assert_called_once_with(702 if len(codes) > 1 else 701, len(codes) == 1, base + "\n\n✅ X'te paylaşıldı.")
+                    else:
+                        x_request.assert_not_called()
+                        edit.assert_not_called()
+                        self.assertEqual(photo.call_args.args[1], base + "\n\n⏭ X'te paylaşılmadı: BIST 100 / özel liste dışında.")
+                    self.assertEqual(photo.call_count, len(codes))
+                    self.assertEqual(message.call_count, int(len(codes) > 1))
+                    self.assertEqual(store.queued_circuits(), [])
+
+    def test_telegram_status_edit_failure_retries_without_posting_x_again(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            store = kap_bot.Store(Path(directory) / "test.sqlite3")
+            self.addCleanup(store.close)
+            store.save(100, True, "DKB")
+            store.queue_circuit(100, "AKBNK")
+            store.db.execute("UPDATE circuit_queue SET queued_at=0")
+            store.db.commit()
+            with patch.dict(os.environ, {"X_AUTO_POST_DKB": "true", "X_DKB_AUTO_POST_TICKERS": "AKBNK"}), \
+                 patch.object(kap_bot, "build_circuit_card", return_value=str(Path(directory) / "card.png")), \
+                 patch.object(kap_bot, "telegram_send_photo", return_value=701) as photo, \
+                 patch.object(kap_bot, "telegram_edit_dkb", side_effect=[False, True]) as edit, \
+                 patch.object(kap_bot, "x_post_circuit_batch", return_value="x-post") as post:
+                kap_bot.flush_circuit_queue(store)
+                self.assertEqual(len(store.pending_telegram_dkb_status()), 1)
+                kap_bot.flush_circuit_queue(store)
+                post.assert_called_once()
+                photo.assert_called_once()
+                self.assertEqual(edit.call_count, 2)
+                self.assertEqual(store.pending_telegram_dkb_status(), [])
 
     def test_ai_tweet_finalizer_removes_link_and_keeps_tags(self):
         result = kap_bot.finalise_ai_tweet("Şirket sözleşme imzaladı. https://example.com", ["BRLSM"])
