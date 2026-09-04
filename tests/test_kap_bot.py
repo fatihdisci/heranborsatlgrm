@@ -206,6 +206,49 @@ class KapBotTests(unittest.TestCase):
             self.assertEqual(calls, [(["HEDEF", "ALVES", "KPEKS"], ["HEDEF", "ALVES", "KPEKS"])])
             self.assertTrue(all(store.x_posted(ident) for ident in (100, 101, 102)))
 
+    def test_x_failure_keeps_dkb_queued_without_repeating_telegram_batch_text(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            store = kap_bot.Store(Path(directory) / "test.sqlite3")
+            self.addCleanup(store.close)
+            original = {
+                "X_AUTO_POST_DKB": os.environ.get("X_AUTO_POST_DKB"),
+                "card": kap_bot.build_circuit_card,
+                "photo": kap_bot.telegram_send_photo,
+                "message": kap_bot.telegram_send,
+                "x_post": kap_bot.x_post_circuit_batch,
+                "log_exception": kap_bot.logging.exception,
+            }
+            messages = []
+            try:
+                os.environ["X_AUTO_POST_DKB"] = "true"
+                def card(code):
+                    path = Path(directory) / f"{code}.png"
+                    path.touch()
+                    return str(path)
+                kap_bot.build_circuit_card = card
+                kap_bot.telegram_send_photo = lambda path, text: True
+                kap_bot.telegram_send = lambda text: messages.append(text) or True
+                kap_bot.x_post_circuit_batch = lambda codes, paths: (_ for _ in ()).throw(RuntimeError("X unavailable"))
+                kap_bot.logging.exception = lambda *args, **kwargs: None
+                for index, code in enumerate(("AKBNK", "ASELS"), 100):
+                    store.save(index, True, "Pay Bazında Devre Kesici Bildirimi")
+                    store.queue_circuit(index, code)
+                store.db.execute("UPDATE circuit_queue SET queued_at=0")
+                store.db.commit()
+                kap_bot.flush_circuit_queue(store)
+                kap_bot.flush_circuit_queue(store)
+            finally:
+                kap_bot.build_circuit_card = original["card"]
+                kap_bot.telegram_send_photo = original["photo"]
+                kap_bot.telegram_send = original["message"]
+                kap_bot.x_post_circuit_batch = original["x_post"]
+                kap_bot.logging.exception = original["log_exception"]
+                if original["X_AUTO_POST_DKB"] is None: os.environ.pop("X_AUTO_POST_DKB", None)
+                else: os.environ["X_AUTO_POST_DKB"] = original["X_AUTO_POST_DKB"]
+            self.assertEqual(messages, ["#AKBNK #ASELS Devre kesti. #borsa #bist"])
+            self.assertEqual([row[0] for row in store.queued_circuits()], [100, 101])
+
     def test_single_circuit_keeps_caption_with_its_own_card(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:

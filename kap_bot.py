@@ -133,6 +133,7 @@ class Store:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(disclosures)")}
         if "x_post_id" not in columns: self.db.execute("ALTER TABLE disclosures ADD COLUMN x_post_id TEXT")
         if "telegram_link_sent" not in columns: self.db.execute("ALTER TABLE disclosures ADD COLUMN telegram_link_sent INTEGER NOT NULL DEFAULT 0")
+        if "telegram_caption_sent" not in columns: self.db.execute("ALTER TABLE disclosures ADD COLUMN telegram_caption_sent INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
     def get_cursor(self, key="cursor"):
         row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone(); return int(row[0]) if row else None
@@ -153,6 +154,10 @@ class Store:
         row = self.db.execute("SELECT telegram_link_sent FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
     def mark_telegram_link_sent(self, ident):
         self.db.execute("UPDATE disclosures SET telegram_link_sent=1 WHERE id=?", (ident,)); self.db.commit()
+    def telegram_caption_sent(self, ident):
+        row = self.db.execute("SELECT telegram_caption_sent FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
+    def mark_telegram_caption_sent(self, identifiers):
+        self.db.executemany("UPDATE disclosures SET telegram_caption_sent=1 WHERE id=?", ((ident,) for ident in identifiers)); self.db.commit()
     def x_posted(self, ident):
         row = self.db.execute("SELECT x_post_id FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
     def mark_x_posted(self, ident, post_id):
@@ -740,9 +745,10 @@ def flush_circuit_queue(store, dry_run=False):
             message = circuit_batch_tweet(codes)
             if dry_run:
                 logging.info("DRY RUN DKB ortak metni: %s", message)
-            elif not telegram_send(message):
-                return delivered
-            logging.info("Telegram DKB ortak metni gönderildi: %s", ",".join(map(str, identifiers)))
+            elif not all(store.telegram_caption_sent(ident) for ident in identifiers):
+                if not telegram_send(message): return delivered
+                store.mark_telegram_caption_sent(identifiers)
+                logging.info("Telegram DKB ortak metni gönderildi: %s", ",".join(map(str, identifiers)))
         if not dry_run and cfg("X_AUTO_POST_DKB", "false").lower() == "true":
             if not x_dkb_auto_post_allowed(codes):
                 logging.info("X DKB paylaşımı izin listesi dışında kaldı: %s", ",".join(codes))
@@ -753,6 +759,10 @@ def flush_circuit_queue(store, dry_run=False):
                     logging.info("X DKB paylaşımı yapıldı: %s", ",".join(map(str, identifiers)))
                 except Exception:
                     logging.exception("X DKB paylaşımı başarısız: %s", ",".join(map(str, identifiers)))
+                    # Do not lose an eligible DKB on a transient X/OAuth failure.
+                    # Telegram is already marked separately, so retrying will only
+                    # recreate the card and attempt the missing X post.
+                    return delivered
             elif not all(store.x_posted(ident) for ident in identifiers):
                 logging.warning("DKB grubu kısmen X'e aktarılmış; tekrar paylaşım yapılmadı: %s", ",".join(map(str, identifiers)))
         if not dry_run: store.remove_queued_circuits(identifiers)
