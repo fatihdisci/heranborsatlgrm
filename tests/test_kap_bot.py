@@ -182,7 +182,7 @@ class KapBotTests(unittest.TestCase):
                 kap_bot.build_circuit_card = original_card
             self.assertEqual([call[0] for call in calls], ["photo", "photo", "photo", "text"])
             self.assertTrue(all(call[2] == "" for call in calls[:3]))
-            self.assertEqual(calls[-1][1], "#HEDEF #ALVES #KPEKS Devre kesti. #borsa #bist\n\n⏸ X'te paylaşılmadı: otomatik paylaşım kapalı.")
+            self.assertEqual(calls[-1][1], "#HEDEF #ALVES #KPEKS Devre kesti. #borsa #bist")
 
     def test_circuit_batch_posts_its_cards_in_one_x_post(self):
         import tempfile
@@ -263,7 +263,7 @@ class KapBotTests(unittest.TestCase):
                 kap_bot.logging.exception = original["log_exception"]
                 if original["X_AUTO_POST_DKB"] is None: os.environ.pop("X_AUTO_POST_DKB", None)
                 else: os.environ["X_AUTO_POST_DKB"] = original["X_AUTO_POST_DKB"]
-            self.assertEqual(messages, ["#AKBNK #ASELS Devre kesti. #borsa #bist\n\n⏳ X paylaşımı bekleniyor."])
+            self.assertEqual(messages, ["#AKBNK #ASELS Devre kesti. #borsa #bist"])
             self.assertEqual([row[0] for row in store.queued_circuits()], [100, 101])
 
     def test_single_circuit_keeps_caption_with_its_own_card(self):
@@ -287,9 +287,9 @@ class KapBotTests(unittest.TestCase):
                 kap_bot.flush_circuit_queue(store)
             finally:
                 kap_bot.telegram_send_photo, kap_bot.build_circuit_card = original_photo, original_card
-            self.assertEqual(calls, [("HEDEF", "#HEDEF Devre kesti. #borsa #bist\n\n⏸ X'te paylaşılmadı: otomatik paylaşım kapalı.")])
+            self.assertEqual(calls, [("HEDEF", "#HEDEF Devre kesti. #borsa #bist")])
 
-    def test_dkb_status_updates_same_telegram_message_without_changing_x_text(self):
+    def test_dkb_status_replies_to_clean_telegram_message_without_changing_x_text(self):
         import tempfile
         from unittest.mock import patch
         for codes in (["AKBNK"], ["AKBNK", "HEDEF"], ["HEDEF"]):
@@ -305,6 +305,7 @@ class KapBotTests(unittest.TestCase):
                      patch.object(kap_bot, "build_circuit_card", side_effect=lambda code: str(Path(directory) / f"{code}.png")), \
                      patch.object(kap_bot, "telegram_send_photo", return_value=701) as photo, \
                      patch.object(kap_bot, "telegram_send", return_value=702) as message, \
+                     patch.object(kap_bot, "telegram_send_reply", return_value=703) as reply, \
                      patch.object(kap_bot, "telegram_edit_dkb", return_value=True) as edit, \
                      patch.object(kap_bot, "x_dkb_include_visuals", return_value=False), \
                      patch.object(kap_bot, "x_request", return_value={"data": {"id": "x-post"}}) as x_request:
@@ -312,16 +313,18 @@ class KapBotTests(unittest.TestCase):
                     base = " ".join(f"#{code}" for code in codes) + " Devre kesti. #borsa #bist"
                     if "AKBNK" in codes:
                         self.assertEqual(x_request.call_args.args[2], {"text": base})
-                        edit.assert_called_once_with(702 if len(codes) > 1 else 701, len(codes) == 1, base + "\n\n✅ X'te paylaşıldı.")
+                        reply.assert_called_once_with("✅ X'te paylaşıldı.", 702 if len(codes) > 1 else 701)
                     else:
                         x_request.assert_not_called()
-                        edit.assert_not_called()
-                        self.assertEqual(photo.call_args.args[1], base + "\n\n⏭ X'te paylaşılmadı: BIST 100 / özel liste dışında.")
+                        reply.assert_called_once_with("⏭ X'te paylaşılmadı: BIST 100 / özel liste dışında.", 701)
+                    edit.assert_not_called()
+                    if len(codes) == 1: self.assertEqual(photo.call_args.args[1], base)
+                    else: message.assert_called_once_with(base)
                     self.assertEqual(photo.call_count, len(codes))
                     self.assertEqual(message.call_count, int(len(codes) > 1))
                     self.assertEqual(store.queued_circuits(), [])
 
-    def test_telegram_status_edit_failure_retries_without_posting_x_again(self):
+    def test_telegram_status_reply_failure_retries_without_posting_x_again(self):
         import tempfile
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:
@@ -334,14 +337,35 @@ class KapBotTests(unittest.TestCase):
             with patch.dict(os.environ, {"X_AUTO_POST_DKB": "true", "X_DKB_AUTO_POST_TICKERS": "AKBNK"}), \
                  patch.object(kap_bot, "build_circuit_card", return_value=str(Path(directory) / "card.png")), \
                  patch.object(kap_bot, "telegram_send_photo", return_value=701) as photo, \
-                 patch.object(kap_bot, "telegram_edit_dkb", side_effect=[False, True]) as edit, \
+                 patch.object(kap_bot, "telegram_send_reply", side_effect=[False, 703]) as reply, \
                  patch.object(kap_bot, "x_post_circuit_batch", return_value="x-post") as post:
                 kap_bot.flush_circuit_queue(store)
                 self.assertEqual(len(store.pending_telegram_dkb_status()), 1)
                 kap_bot.flush_circuit_queue(store)
                 post.assert_called_once()
                 photo.assert_called_once()
-                self.assertEqual(edit.call_count, 2)
+                self.assertEqual(reply.call_count, 2)
+                self.assertEqual(store.pending_telegram_dkb_status(), [])
+
+    def test_old_inline_status_is_cleaned_and_reply_is_updated_after_retry(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            store = kap_bot.Store(Path(directory) / "test.sqlite3")
+            self.addCleanup(store.close)
+            base = "#AKBNK Devre kesti. #borsa #bist"
+            store.register_telegram_dkb_status([100], 701, True, base, "retry")
+            store.db.execute("UPDATE telegram_dkb_status SET original_clean=0")
+            store.db.commit()
+            with patch.object(kap_bot, "telegram_edit_dkb", return_value=True) as edit, \
+                 patch.object(kap_bot, "telegram_send_reply", return_value=703) as reply:
+                kap_bot.flush_telegram_dkb_status(store)
+                edit.assert_called_once_with(701, 1, base)
+                reply.assert_called_once_with("⚠️ X paylaşımı bekliyor: gönderim hatası, tekrar denenecek.", 701)
+                store.set_telegram_dkb_status([100], "posted")
+                kap_bot.flush_telegram_dkb_status(store)
+                self.assertEqual(edit.call_args.args, (703, False, "✅ X'te paylaşıldı."))
+                reply.assert_called_once()
                 self.assertEqual(store.pending_telegram_dkb_status(), [])
 
     def test_ai_tweet_finalizer_removes_link_and_keeps_tags(self):

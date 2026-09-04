@@ -132,6 +132,9 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS circuit_queue (id INTEGER PRIMARY KEY, code TEXT NOT NULL, queued_at REAL NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS telegram_dkb_status (message_id INTEGER PRIMARY KEY, is_caption INTEGER NOT NULL, base_text TEXT NOT NULL, status TEXT NOT NULL, desired_status TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS telegram_dkb_status_items (id INTEGER NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY(id,message_id))")
+        status_columns = {row[1] for row in self.db.execute("PRAGMA table_info(telegram_dkb_status)")}
+        if "reply_message_id" not in status_columns: self.db.execute("ALTER TABLE telegram_dkb_status ADD COLUMN reply_message_id INTEGER")
+        if "original_clean" not in status_columns: self.db.execute("ALTER TABLE telegram_dkb_status ADD COLUMN original_clean INTEGER NOT NULL DEFAULT 0")
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(disclosures)")}
         if "x_post_id" not in columns: self.db.execute("ALTER TABLE disclosures ADD COLUMN x_post_id TEXT")
         if "telegram_link_sent" not in columns: self.db.execute("ALTER TABLE disclosures ADD COLUMN telegram_link_sent INTEGER NOT NULL DEFAULT 0")
@@ -162,14 +165,16 @@ class Store:
         self.db.executemany("UPDATE disclosures SET telegram_caption_sent=1 WHERE id=?", ((ident,) for ident in identifiers)); self.db.commit()
     def register_telegram_dkb_status(self, identifiers, message_id, is_caption, base_text, status):
         if type(message_id) is not int: return
-        self.db.execute("INSERT OR REPLACE INTO telegram_dkb_status VALUES(?,?,?,?,?)", (message_id, int(is_caption), base_text, status, status))
+        self.db.execute("INSERT OR REPLACE INTO telegram_dkb_status(message_id,is_caption,base_text,status,desired_status,original_clean) VALUES(?,?,?,?,?,1)", (message_id, int(is_caption), base_text, status, status))
         self.db.executemany("INSERT OR REPLACE INTO telegram_dkb_status_items VALUES(?,?)", ((ident, message_id) for ident in identifiers)); self.db.commit()
     def set_telegram_dkb_status(self, identifiers, status):
         self.db.executemany("UPDATE telegram_dkb_status SET desired_status=? WHERE message_id IN (SELECT message_id FROM telegram_dkb_status_items WHERE id=?)", ((status, ident) for ident in identifiers)); self.db.commit()
     def pending_telegram_dkb_status(self):
-        return self.db.execute("SELECT message_id,is_caption,base_text,desired_status FROM telegram_dkb_status WHERE status != desired_status").fetchall()
-    def mark_telegram_dkb_status(self, message_id, status):
-        self.db.execute("UPDATE telegram_dkb_status SET status=? WHERE message_id=?", (status, message_id)); self.db.commit()
+        return self.db.execute("SELECT message_id,is_caption,base_text,desired_status,reply_message_id,original_clean FROM telegram_dkb_status WHERE status != desired_status OR reply_message_id IS NULL OR original_clean=0").fetchall()
+    def mark_telegram_dkb_status(self, message_id, status, reply_message_id=None):
+        self.db.execute("UPDATE telegram_dkb_status SET status=?,reply_message_id=COALESCE(?,reply_message_id) WHERE message_id=?", (status, reply_message_id, message_id)); self.db.commit()
+    def mark_telegram_dkb_original_clean(self, message_id):
+        self.db.execute("UPDATE telegram_dkb_status SET original_clean=1 WHERE message_id=?", (message_id,)); self.db.commit()
     def x_posted(self, ident):
         row = self.db.execute("SELECT x_post_id FROM disclosures WHERE id=?", (ident,)).fetchone(); return bool(row and row[0])
     def mark_x_posted(self, ident, post_id):
@@ -303,7 +308,7 @@ def circuit_batch_tweet(codes):
     unique = list(dict.fromkeys(code for code in codes if code))
     return required_tags(f"{' '.join(f'#{code}' for code in unique)} Devre kesti.", unique)
 
-def telegram_dkb_text(base_text, status):
+def telegram_dkb_status_text(status):
     labels = {
         "pending": "⏳ X paylaşımı bekleniyor.",
         "posted": "✅ X'te paylaşıldı.",
@@ -312,7 +317,7 @@ def telegram_dkb_text(base_text, status):
         "retry": "⚠️ X paylaşımı bekliyor: gönderim hatası, tekrar denenecek.",
         "partial": "⚠️ X paylaşımı kısmen tamamlandı; tekrar paylaşılmadı.",
     }
-    return f"{base_text}\n\n{labels[status]}"
+    return labels[status]
 
 def x_dkb_include_visuals(now=None):
     """Wait for the delayed Yahoo quote before attaching DKB cards to X."""
@@ -409,13 +414,19 @@ def ai_tweet(detail, event=None):
         return None
     return result
 
-def telegram_send(text):
+def telegram_send(text, reply_to_message_id=None):
     token, chat = cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")
     if not token or not chat: logging.warning("Telegram ayarları eksik; bildirim atlanıyor"); return False
-    data = urlencode({"chat_id":chat, "text":text, "disable_web_page_preview":"true"}).encode()
+    fields = {"chat_id":chat, "text":text, "disable_web_page_preview":"true"}
+    if reply_to_message_id is not None:
+        fields["reply_parameters"] = json.dumps({"message_id": reply_to_message_id})
+    data = urlencode(fields).encode()
     with urlopen(Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data), timeout=30) as r:
         result = json.loads(r.read().decode())
         return result.get("result", {}).get("message_id") if result.get("ok") else False
+
+def telegram_send_reply(text, original_message_id):
+    return telegram_send(text, reply_to_message_id=original_message_id)
 
 def telegram_edit_dkb(message_id, is_caption, text):
     token, chat = cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")
@@ -434,9 +445,17 @@ def telegram_edit_dkb(message_id, is_caption, text):
         return False
 
 def flush_telegram_dkb_status(store):
-    for message_id, is_caption, base_text, status in store.pending_telegram_dkb_status():
+    for message_id, is_caption, base_text, status, reply_message_id, original_clean in store.pending_telegram_dkb_status():
         try:
-            if telegram_edit_dkb(message_id, is_caption, telegram_dkb_text(base_text, status)):
+            # Restore captions sent by the previous inline-status version.
+            if not original_clean:
+                if not telegram_edit_dkb(message_id, is_caption, base_text): continue
+                store.mark_telegram_dkb_original_clean(message_id)
+            text = telegram_dkb_status_text(status)
+            if reply_message_id is None:
+                reply_message_id = telegram_send_reply(text, message_id)
+                if reply_message_id: store.mark_telegram_dkb_status(message_id, status, reply_message_id)
+            elif telegram_edit_dkb(reply_message_id, False, text):
                 store.mark_telegram_dkb_status(message_id, status)
         except Exception as error:
             logging.warning("Telegram X durum güncellemesi bekliyor: %s", type(error).__name__)
@@ -790,7 +809,7 @@ def flush_circuit_queue(store, dry_run=False):
                     delivered += 1
                     continue
                 base_text = circuit_tweet(code)
-                caption = "" if is_batch else telegram_dkb_text(base_text, initial_status)
+                caption = "" if is_batch else base_text
                 message_id = telegram_send_photo(cards[ident], caption)
                 if message_id:
                     store.mark_telegram_sent(ident)
@@ -805,7 +824,7 @@ def flush_circuit_queue(store, dry_run=False):
             if dry_run:
                 logging.info("DRY RUN DKB ortak metni: %s", message)
             elif not all(store.telegram_caption_sent(ident) for ident in identifiers):
-                message_id = telegram_send(telegram_dkb_text(message, initial_status))
+                message_id = telegram_send(message)
                 if not message_id: return delivered
                 store.register_telegram_dkb_status(identifiers, message_id, False, message, initial_status)
                 store.mark_telegram_caption_sent(identifiers)
