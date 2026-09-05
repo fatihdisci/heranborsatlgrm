@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """KAP test API -> important disclosure -> Turkish draft -> Telegram."""
 import argparse, base64, hashlib, hmac, html, json, os, re, secrets, sqlite3, time, tempfile, webbrowser
-import logging, threading
+import logging
 from datetime import datetime, time as clock_time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -10,8 +10,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from kap_source import parse_public_page, complete_source
-from kap_editorial import prepare_editorial
+from kap_source import parse_public_page
 
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
@@ -99,7 +98,6 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS disclosures (id INTEGER PRIMARY KEY, important INTEGER NOT NULL, telegram_sent INTEGER NOT NULL DEFAULT 0, title TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
         self.db.execute("CREATE TABLE IF NOT EXISTS circuit_queue (id INTEGER PRIMARY KEY, code TEXT NOT NULL, queued_at REAL NOT NULL)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS editorial_queue (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS telegram_dkb_status (message_id INTEGER PRIMARY KEY, is_caption INTEGER NOT NULL, base_text TEXT NOT NULL, status TEXT NOT NULL, desired_status TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS telegram_dkb_status_items (id INTEGER NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY(id,message_id))")
         status_columns = {row[1] for row in self.db.execute("PRAGMA table_info(telegram_dkb_status)")}
@@ -157,12 +155,6 @@ class Store:
         if not identifiers: return
         self.db.executemany("DELETE FROM circuit_queue WHERE id=?", ((ident,) for ident in identifiers)); self.db.commit()
     def close(self): self.db.close()
-    def queue_editorial(self, ident, item, detail):
-        self.db.execute("INSERT OR IGNORE INTO editorial_queue VALUES(?,?)", (ident, json.dumps([item, detail], ensure_ascii=False))); self.db.commit()
-    def next_editorial(self):
-        return self.db.execute("SELECT id,payload FROM editorial_queue ORDER BY id LIMIT 1").fetchone()
-    def remove_editorial(self, ident):
-        self.db.execute("DELETE FROM editorial_queue WHERE id=?", (ident,)); self.db.commit()
 
 KEYWORDS = re.compile(r"temettü|bedelli|bedelsiz|sermaye artır|geri alım|ihale sonucu|sözleşme\w*\s+imzalan|iş ilişkisi|yatırım projesi|kapasite artış|birleşme|satın alma|finansal sonuç|net kâr|net zarar|iflas|konkordato|geri alım programı|pay alım satım|özel durum|devre kesici|sürekli işleme ara|tek fiyat emir toplama|faaliyet.*durdur|imkansız hale", re.I)
 NOISE = re.compile(r"borsa dışı repo|yatırımcı bilgi formu|yönetim kurulu komiteleri|varant|itfa fiyat|summernote|project|issues", re.I)
@@ -174,7 +166,11 @@ SPECIAL_EVENTS = (
     ("suspension", "FAALİYET DURDURMA", re.compile(r"faaliyetlerin kısmen veya tamamen durdurulması|faaliyet.*durdurul|imkansız hale", re.I)),
 )
 def clean(value):
-    text = re.sub(r"<[^>]+>", " ", html.unescape(value or "")); return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"<[^>]+>", " ", html.unescape(value or ""))
+    # Some KAP metadata contains a literal question mark where the Turkish
+    # apostrophe should be (for example "Tebliği?nin"). Repair only suffixes.
+    text = re.sub(r"\?(?=(?:n[iıuü]n|d[ae]|t[ae])\b)", "'", text, flags=re.I)
+    return re.sub(r"\s+", " ", text).strip()
 
 def extract_disclosure_content(source):
     """Return every paragraph from KAP's disclosure body, not only the first."""
@@ -275,6 +271,14 @@ def draft(detail):
     codes = " ".join(f"#{code}" for code in stocks(detail))
     return "\n".join(part for part in (codes, title, detail.get("link", "")) if part)
 
+def non_dkb_notification(detail):
+    """Send only KAP metadata; do not read, summarize or reinterpret the body."""
+    codes = " ".join(f"#{code}" for code in stocks(detail)) or "Hisse kodu yok"
+    title = clean(text_of(detail.get("summary"))) or "-"
+    kind = clean(text_of(detail.get("subject"))) or "-"
+    link = clean(detail.get("link", ""))
+    return f"{codes}\nBaşlık: {title}\nTür: {kind}\n{link}".strip()
+
 def circuit_tweet(code):
     """The ready-to-post text paired with every circuit-breaker card."""
     return f"#{code} Devre kesti. #borsa #bist"
@@ -329,9 +333,6 @@ def factual_tweet(detail, event=None):
     body = event_summary(detail, event, 220)
     prefix = f"#{codes[0]} " if codes and not body.startswith("#") else ""
     return required_tags(tweet_only(prefix + body), codes)
-
-def finalise_ai_tweet(text, codes):
-    return required_tags(tweet_only(text), codes)
 
 def telegram_send(text, reply_to_message_id=None):
     token, chat = cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")
@@ -482,43 +483,6 @@ def render_circuit_card(code, market):
     draw.text((90, 552), "İşlemler tek fiyat yöntemiyle devam ediyor.", font=card_font(21), fill=muted)
     draw.text((90, 582), CIRCUIT_DATA_NOTE, font=card_font(16), fill=muted)
     handle = tempfile.NamedTemporaryFile(prefix=f"kap-{code}-", suffix=".png", delete=False)
-    handle.close(); image.save(handle.name, "PNG", optimize=True)
-    return handle.name
-
-def render_event_card(event, label, detail):
-    """Render only the same verified article used for the tweet; never re-extract facts."""
-    article = detail.get("editorial")
-    if not article: raise ValueError("Doğrulanmış editoryal içerik bulunamadı")
-    image = card_background("event-background.jpg", (720, 1280))
-    draw = ImageDraw.Draw(image)
-    dark, muted, gold = "#111111", "#5D5D5D", "#A16C0B"
-    def block(text, y, size, minimum, height, bold=False, color=dark):
-        for font_size in range(size, minimum - 1, -1):
-            font = card_font(font_size, bold)
-            lines, line = [], ""
-            too_wide = False
-            for word in text.split():
-                if draw.textlength(word, font=font) > 608: too_wide = True
-                candidate = (line + " " + word).strip()
-                if line and draw.textlength(candidate, font=font) > 608:
-                    lines.append(line); line = word
-                else: line = candidate
-            if line: lines.append(line)
-            step = int(font_size * 1.25)
-            if not too_wide and len(lines) * step <= height:
-                for i, value in enumerate(lines): draw.text((56, y + i * step), value, font=font, fill=color)
-                return y + len(lines) * step
-        raise ValueError("Doğrulanmış metin görsele okunaklı biçimde sığmadı; kırpılmadı")
-    uppercase = lambda text: text.translate(str.maketrans({"i": "İ", "ı": "I"})).upper()
-    y = block(uppercase(article["headline"]), 88, 48, 40, 180, True) + 20
-    y = block("  ".join(f"#{c}" for c in article["tickers"]), y, 32, 27, 84, True, gold) + 28
-    facts = article.get("facts", [])
-    summary_height = min(490, 1080 - y - len(facts) * 150)
-    y = block(article["summary"], y, 32, 27, summary_height) + 34
-    for fact in facts:
-        y = block(uppercase(fact["label"]), y, 21, 19, 56, True, muted) + 8
-        y = block(fact["value"], y, 38, 28, min(100, 1110 - y), True, gold) + 25
-    handle = tempfile.NamedTemporaryFile(prefix=f"kap-{event}-", suffix=".png", delete=False)
     handle.close(); image.save(handle.name, "PNG", optimize=True)
     return handle.name
 
@@ -786,28 +750,19 @@ def deliver(store, ident, item, detail, dry_run):
     important = is_important(item, detail)
     store.save(ident, important, text_of(detail.get("subject")))
     if not important: return 0
-    event = special_event(detail)
     is_circuit = item.get("disclosureType") == "DKB"
     if is_circuit:
         message = circuit_tweet(stocks(detail)[0])
     else:
-        report = editorial_report(detail)
-        logging.info("KAP editoryal kontrol: %s model=%s durum=%s", ident, report.get("model"), report["status"])
-        if report["status"] != "ready":
-            return deliver_editorial_review(store, ident, detail, report.get("reason", "İnceleme gerekli"), dry_run)
-        detail = dict(detail, editorial=report["article"])
-        message = report["tweet"]
+        message = non_dkb_notification(detail)
     card = None
     try:
         if is_circuit:
             card = build_circuit_card(stocks(detail)[0])
-        else: card = render_event_card(report["article"]["category"], report["article"]["headline"], detail)
     except Exception as error:
-        if not is_circuit: return deliver_editorial_review(store, ident, detail, str(error), dry_run)
         logging.warning("KAP görseli üretilemedi (%s); sade metin gönderiliyor", type(error).__name__)
-    link = clean(detail.get("link", ""))
     if dry_run:
-        logging.info("DRY RUN:\n%s%s", message, f"\n{link}" if (link and not is_circuit) else "")
+        logging.info("DRY RUN:\n%s", message)
     else:
         # Track the media/text and the link independently. If the second
         # Telegram call fails, the next retry sends only the missing link.
@@ -817,10 +772,6 @@ def deliver(store, ident, item, detail, dry_run):
             if primary_sent:
                 store.mark_telegram_sent(ident)
                 logging.info("Telegram gönderildi: %s", ident)
-        if primary_sent and not is_circuit and link and not store.telegram_link_sent(ident):
-            if telegram_send(link):
-                store.mark_telegram_link_sent(ident)
-                logging.info("Telegram KAP linki gönderildi: %s", ident)
     # Even if this explicit switch is enabled later, only circuit breakers may
     # be posted automatically. All other KAP cards remain Telegram-only.
     if is_circuit and card and cfg("X_AUTO_POST_DKB", "false").lower() == "true" and x_dkb_auto_post_allowed(stocks(detail)) and not store.x_posted(ident) and not dry_run:
@@ -832,39 +783,6 @@ def deliver(store, ident, item, detail, dry_run):
             logging.exception("X paylaşımı başarısız: %s", ident)
     if card: Path(card).unlink(missing_ok=True)
     return 1
-
-def editorial_report(detail):
-    return prepare_editorial(detail, cfg("AI_API_KEY"), cfg("AI_BASE_URL", "https://api.openai.com/v1"), cfg("AI_MODEL", "gpt-5.6-luna"), ROOT / "data/editorial")
-
-def deliver_editorial_review(store, ident, detail, reason, dry_run):
-    notice = "⚠️ KAP bildirimi inceleme bekliyor\n" + " ".join(f"#{c}" for c in stocks(detail)) + "\n" + text_of(detail.get("subject")) + "\n\n" + reason[:800]
-    if dry_run:
-        logging.info("DRY RUN: %s", notice)
-        return 0
-    if not store.telegram_sent(ident) and telegram_send(notice): store.mark_telegram_sent(ident)
-    link = detail.get("link", "")
-    if store.telegram_sent(ident) and link and not store.telegram_link_sent(ident) and telegram_send(link): store.mark_telegram_link_sent(ident)
-    return 0
-
-def process_editorial_queue(store, dry_run=False):
-    queued = store.next_editorial()
-    if not queued: return False
-    ident, payload = queued
-    item, detail = json.loads(payload)
-    deliver(store, ident, item, detail, dry_run)
-    if dry_run or (store.telegram_sent(ident) and (not detail.get("link") or store.telegram_link_sent(ident))): store.remove_editorial(ident)
-    return True
-
-def editorial_worker(database_path):
-    store = Store(database_path)
-    try:
-        while True:
-            try: busy = process_editorial_queue(store)
-            except Exception as error:
-                logging.warning("Editoryal kuyruk tekrar denenecek: %s", type(error).__name__)
-                busy = False
-            time.sleep(3 if busy else 10)
-    finally: store.close()
 
 def run_public_once(store, dry_run=False):
     cursor_key = "public_cursor"
@@ -892,7 +810,7 @@ def run_public_once(store, dry_run=False):
         if ident in circuit_ids: continue
         important = is_important(item, detail)
         store.save(ident, important, text_of(detail.get("subject")))
-        if important: store.queue_editorial(ident, item, detail)
+        if important: count += deliver(store, ident, item, detail, dry_run)
     for ident, item, detail in circuits:
         important = is_important(item, detail)
         store.save(ident, important, text_of(detail.get("subject")))
@@ -932,15 +850,10 @@ def main():
         profile = x_verify_identity(); logging.info("X bağlantısı doğrulandı: @%s", profile.get("username")); return
     database_path = cfg("DATABASE_PATH", "data/kap_bot.sqlite3")
     store=Store(database_path)
-    if cfg("KAP_SOURCE", "public").lower() == "public" and not args.once and not args.dry_run:
-        threading.Thread(target=editorial_worker, args=(database_path,), daemon=True, name="kap-editorial").start()
     while True:
         try: run_public_once(store, args.dry_run) if cfg("KAP_SOURCE", "public").lower() == "public" else run_once(store, args.dry_run)
         except (HTTPError, URLError, TimeoutError, KeyError, ValueError): logging.exception("KAP kontrolü başarısız")
         except Exception: logging.exception("Beklenmeyen hata")
-        if args.once:
-            for _ in range(20):
-                if not process_editorial_queue(store, args.dry_run): break
-            break
+        if args.once: break
         time.sleep(int(cfg("POLL_INTERVAL_SECONDS", "60")))
 if __name__ == "__main__": main()

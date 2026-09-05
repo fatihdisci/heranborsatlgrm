@@ -1,13 +1,8 @@
 """Read one KAP disclosure's own DOM and metadata, including Turkish tables."""
-import io
 import json
 import re
-import subprocess
-import sys
 from html.parser import HTMLParser
-from pathlib import Path
 from urllib.parse import urlparse, urljoin
-from urllib.request import Request, urlopen
 
 
 def normalize(text):
@@ -136,50 +131,3 @@ def parse_public_page(source, index):
         "body_has_details": has_details,
     }
     return {"disclosureIndex": str(index), "disclosureType": "DKB" if dkb else "PUBLIC"}, detail
-
-
-def complete_source(detail):
-    """Read text PDFs in a bounded subprocess. Never silently omit a failed file."""
-    result = dict(detail)
-    errors, texts = [], []
-    attachments = detail.get("attachments", [])
-    if detail.get("attachment_count", len(attachments)) != len(attachments): errors.append("Ek listesi eksik")
-    if len(attachments) > 5: errors.append("Ek sayısı otomatik okuma sınırını aşıyor")
-    for attachment in attachments[:5]:
-        try:
-            parsed = urlparse(attachment["url"])
-            if parsed.scheme != "https" or parsed.hostname not in {"kap.org.tr", "www.kap.org.tr"}: raise ValueError("Ek adresi doğrulanamadı")
-            req = Request(attachment["url"], headers={"User-Agent": "Mozilla/5.0"})
-            with urlopen(req, timeout=20) as response:
-                if urlparse(response.url).hostname not in {"kap.org.tr", "www.kap.org.tr"}: raise ValueError("Ek yönlendirmesi doğrulanamadı")
-                data = response.read(10_000_001)
-            if len(data) > 10_000_000: raise ValueError("Ek boyut sınırını aşıyor")
-            data = unwrap_kap_pdf(data)
-            process = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--pdf-text"], input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
-            if process.returncode: raise ValueError("PDF metni eksik ya da okunamıyor")
-            texts.append(f"EK: {attachment['name']}\n{process.stdout.decode('utf-8')}")
-        except Exception as error:
-            errors.append(f"{attachment.get('name', 'Ek')}: {type(error).__name__}")
-    result["content"] = {"tr": "\n\n".join([detail.get("content", {}).get("tr", "")] + texts)}
-    result["source_errors"] = errors
-    result["source_complete"] = detail.get("source_complete", True) and not errors
-    result["body_has_details"] = detail.get("body_has_details", True) or bool(texts)
-    return result
-
-
-def unwrap_kap_pdf(data):
-    # KAP sometimes returns a Java-serialized byte[] containing the PDF.
-    # Only remove the known serialization header; never deserialize Java objects.
-    offset = data.find(b"%PDF-")
-    if data.startswith(b"\xac\xed\x00\x05") and 0 < offset < 64: data = data[offset:]
-    if not data.startswith(b"%PDF-"): raise ValueError("Ek PDF olarak doğrulanamadı")
-    return data
-
-
-if __name__ == "__main__" and "--pdf-text" in sys.argv:
-    from pypdf import PdfReader
-    reader = PdfReader(io.BytesIO(sys.stdin.buffer.read()))
-    if len(reader.pages) > 40: raise ValueError("PDF page limit")
-    pages = [page.extract_text(extraction_mode="layout") or "" for page in reader.pages]
-    if not pages or any(len(normalize(page)) < 20 for page in pages): raise ValueError("PDF needs visual/OCR review")
-    print("\n\n".join(f"SAYFA {i + 1}\n{page}" for i, page in enumerate(pages)))

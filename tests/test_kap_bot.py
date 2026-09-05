@@ -7,43 +7,25 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import kap_bot
 import kap_source
-import kap_editorial
 
 
 class KapBotTests(unittest.TestCase):
-    def test_non_dkb_review_does_not_send_card_or_x_post(self):
+    def test_non_dkb_sends_only_title_type_and_link(self):
         import tempfile
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:
             store = kap_bot.Store(Path(directory) / "test.sqlite3")
             self.addCleanup(store.close)
-            detail = {"subject": {"tr": "Yeni İş İlişkisi"}, "content": {"tr": "Eksik açıklama"}, "relatedStocks": [{"code": "AKBNK"}], "link": "https://www.kap.org.tr/tr/Bildirim/123"}
+            detail = {"subject": {"tr": "Yeni İş İlişkisi"}, "summary": {"tr": "Yeni sözleşme hakkında açıklama"}, "content": {"tr": "Gönderilmemesi gereken uzun içerik"}, "relatedStocks": [{"code": "AKBNK"}], "link": "https://www.kap.org.tr/tr/Bildirim/123"}
             with patch.dict(os.environ, {"X_AUTO_POST_DKB": "true"}), \
-                 patch.object(kap_bot, "editorial_report", return_value={"status": "review", "reason": "Kaynak eksik"}), \
-                 patch.object(kap_bot, "render_event_card") as card, \
                  patch.object(kap_bot, "telegram_send", return_value=101) as send, \
                  patch.object(kap_bot, "x_post_circuit_breaker") as post:
                 kap_bot.deliver(store, 123, {"disclosureType": "PUBLIC"}, detail, False)
-                card.assert_not_called()
                 post.assert_not_called()
-                self.assertIn("inceleme bekliyor", send.call_args_list[0].args[0])
-                self.assertEqual(send.call_args_list[1].args[0], detail["link"])
-
-    def test_incomplete_source_cannot_fall_back_to_title_only_generation(self):
-        import tempfile
-        from unittest.mock import patch
-        detail = {"subject": {"tr": "Yeni İş İlişkisi"}, "summary": {"tr": "Sözleşme"}, "content": {"tr": "Sözleşme"}, "source_complete": True, "body_has_details": False}
-        with tempfile.TemporaryDirectory() as directory, \
-             patch.object(kap_editorial, "complete_source", return_value=detail), \
-             patch.object(kap_editorial, "request_json") as api:
-            result = kap_editorial.prepare_editorial(detail, "unused", "unused", "test", directory)
-            self.assertEqual(result["status"], "review")
-            api.assert_not_called()
-
-    def test_kap_pdf_wrapper_is_removed_without_deserializing_objects(self):
-        pdf = b"%PDF-1.7\nexample"
-        self.assertEqual(kap_source.unwrap_kap_pdf(b"\xac\xed\x00\x05" + b"header" + pdf), pdf)
-        with self.assertRaises(ValueError): kap_source.unwrap_kap_pdf(b"<html>" + pdf)
+                self.assertEqual(send.call_count, 1)
+                message = send.call_args.args[0]
+                self.assertEqual(message, "#AKBNK\nBaşlık: Yeni sözleşme hakkında açıklama\nTür: Yeni İş İlişkisi\nhttps://www.kap.org.tr/tr/Bildirim/123")
+                self.assertNotIn("uzun içerik", message)
 
     def test_public_parser_uses_official_title_and_reads_turkish_table_values(self):
         import json
@@ -60,16 +42,6 @@ class KapBotTests(unittest.TestCase):
         self.assertIn("Derecelendirme Şirketi | Kobirate", detail["content"]["tr"])
         self.assertNotIn("Wrong English", detail["content"]["tr"])
         self.assertEqual(detail["attachments"][0]["name"], "Ek PDF")
-
-    def test_editorial_validation_rejects_wrong_category_and_invented_numbers(self):
-        source = {"subject": "Geri Alınan Payların Elden Çıkarılması", "summary": "Pay satışı", "content": "Şirket 100 adet payı 2,50 TL fiyattan sattı. İşlem tamamlandı.", "tickers": ["TEST"]}
-        draft = {"decision": "publish", "category": "buyback", "headline": "Pay geri alımı", "summary": "Şirket 100 adet payı 2,50 TL fiyattan sattı. İşlem tamamlandı ve satış bilgileri açıklandı.", "tweet_body": "Şirket 100 adet payını 2,50 TL fiyattan sattı. İşlem tamamlandı.", "tickers": ["TEST"], "evidence": ["Şirket 100 adet payı 2,50 TL fiyattan sattı. İşlem tamamlandı."], "facts": []}
-        with self.assertRaisesRegex(kap_editorial.EditorialError, "yanlış sınıflandırılmış"):
-            kap_editorial.validate_draft(draft, source)
-        draft["category"], draft["headline"] = "share_sale", "Pay satışı"
-        draft["tweet_body"] = "Şirket 101 adet payını 2,50 TL fiyattan sattı. İşlem tamamlandı."
-        with self.assertRaisesRegex(kap_editorial.EditorialError, "kaynakta bulunmayan"):
-            kap_editorial.validate_draft(draft, source)
 
     def test_second_oauth_refresh_uses_the_rotated_token_in_same_process(self):
         import tempfile
@@ -194,29 +166,6 @@ class KapBotTests(unittest.TestCase):
             self.assertFalse(store.telegram_link_sent(123))
             store.mark_telegram_link_sent(123)
             self.assertTrue(store.telegram_link_sent(123))
-
-    def test_non_circuit_delivery_sends_link_after_card(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as directory:
-            store = kap_bot.Store(Path(directory) / "test.sqlite3")
-            self.addCleanup(store.close)
-            calls = []
-            original_photo, original_message = kap_bot.telegram_send_photo, kap_bot.telegram_send
-            original_card, original_report = kap_bot.render_event_card, kap_bot.editorial_report
-            try:
-                kap_bot.telegram_send_photo = lambda path, text: calls.append(("photo", text)) or True
-                kap_bot.telegram_send = lambda text: calls.append(("link", text)) or True
-                kap_bot.render_event_card = lambda event, label, detail: str(Path(directory) / "card.png")
-                kap_bot.editorial_report = lambda detail: {"status": "ready", "model": "test", "tweet": "Şirket sözleşme imzaladı. #BRLSM #borsa #bist", "article": {"category": "business", "headline": "Yeni iş ilişkisi"}}
-                Path(directory, "card.png").touch()
-                detail = {"subject": {"tr": "Yeni İş İlişkisi"}, "content": {"tr": "Şirket sözleşme imzaladı."}, "relatedStocks": [{"code": "BRLSM"}], "link": "https://www.kap.org.tr/tr/Bildirim/123"}
-                item = {"disclosureType": "PUBLIC"}
-                kap_bot.deliver(store, 123, item, detail, dry_run=False)
-            finally:
-                kap_bot.telegram_send_photo, kap_bot.telegram_send = original_photo, original_message
-                kap_bot.render_event_card, kap_bot.editorial_report = original_card, original_report
-            self.assertEqual([kind for kind, _ in calls], ["photo", "link"])
-            self.assertEqual(calls[1][1], detail["link"])
 
     def test_circuit_batch_sends_each_card_then_one_shared_tweet(self):
         import tempfile
@@ -431,26 +380,16 @@ class KapBotTests(unittest.TestCase):
                 reply.assert_called_once()
                 self.assertEqual(store.pending_telegram_dkb_status(), [])
 
-    def test_ai_tweet_finalizer_removes_link_and_keeps_tags(self):
-        result = kap_bot.finalise_ai_tweet("Şirket sözleşme imzaladı. https://example.com", ["BRLSM"])
-        self.assertEqual(result, "Şirket sözleşme imzaladı. #BRLSM #borsa #bist")
-
     def test_disclosure_content_includes_all_body_paragraphs(self):
         source = ('text-block-value"><p>İlk ayrıntı.</p><p>İkinci ayrıntı.</p>'
                   '</div></div></div></td><td class="taxonomy-context-value-summernote">')
         self.assertEqual(kap_bot.extract_disclosure_content(source), "İlk ayrıntı. İkinci ayrıntı.")
 
-    def test_event_card_renders(self):
-        detail = {"editorial": {"headline": "Yeni iş ilişkisi", "summary": "Şirket, yeni bir iş ilişkisi kapsamında sözleşme imzaladı. Çalışmalar planlanan takvime göre sürdürülecek.", "tickers": ["BRLSM"], "facts": [{"label": "Sözleşme tutarı", "value": "333.885.496 TL"}]}, "relatedStocks": [{"code": "BRLSM"}]}
-        path = kap_bot.render_event_card("business", "YENİ İŞ İLİŞKİSİ", detail)
-        with Image.open(path) as image: self.assertEqual(image.size, (720, 1280))
-        Path(path).unlink()
-
     def test_project_name_omits_generic_disclosure_lead_in(self):
         detail = {"summary": {"tr": "Şirket ve bağlı ortaklık, İstanbul Uluslararası Finans Merkezi Borsa Binası Projesi kapsamında sözleşme imzaladı."}}
         self.assertEqual(kap_bot.card_project(detail), "İstanbul Uluslararası Finans Merkezi Borsa Binası Projesi")
 
-    def test_editorial_headline_uses_reference_layout(self):
+    def test_event_headline_uses_reference_layout(self):
         self.assertEqual(kap_bot.event_headline("YENİ İŞ İLİŞKİSİ"), ["YENİ İŞ", "İLİŞKİSİ"])
 
     def test_branded_backgrounds_are_available(self):
